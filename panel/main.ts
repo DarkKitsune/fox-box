@@ -12,6 +12,7 @@ import {
   mountTextField,
   mountText,
 } from "@openchamber/sdk/ui";
+import { extractJsonObject, fillValuesFromJson, type FillField } from "./fill";
 
 /* ------------------------------------------------------------------ */
 /*  Constants and types                                               */
@@ -1536,6 +1537,92 @@ async function generateText(
   return result;
 }
 
+/*
+ * Fill only the empty fields of a small-model form. This deliberately stays on the
+ * host.generate path: it never sends anything to the chat agent. The apply callback
+ * returns false when the form changed while generation was running.
+ */
+async function fillMissingFields(
+  button: ButtonHandle,
+  options: {
+    noun: string;
+    fields: FillField[];
+    system: string;
+    context?: string;
+    maxOutputTokens?: number;
+  },
+  apply: (values: Record<string, string>) => number | boolean | void,
+): Promise<void> {
+  const missing = options.fields.filter((field) => !field.value.trim());
+  if (!missing.length) {
+    toast("info", `Nothing to fill in the ${options.noun}.`);
+    return;
+  }
+  const written = options.fields
+    .filter((field) => field.value.trim())
+    .map((field) => `${field.label} (${field.key}):\n${field.value}`);
+  const shape: Record<string, string> = {};
+  for (const field of missing) shape[field.key] = "string";
+  const notes = missing
+    .map((field) => `- ${field.key}: ${field.label}; at most ${field.max} characters${field.hint ? `; ${field.hint}` : ""}`)
+    .join("\n");
+  const prompt = [
+    `Fill the empty fields of this ${options.noun}.`,
+    written.length
+      ? `Fields already written (keep consistent with them; do not return these keys):\n${written.join("\n\n")}`
+      : `The ${options.noun} is empty. Invent a coherent one.`,
+    options.context?.trim() ? `Context:\n${options.context.trim().slice(0, 12000)}` : "",
+    `Return a JSON object with exactly these keys:\n${JSON.stringify(shape, null, 2)}`,
+    `Field limits and intent:\n${notes}`,
+    "Use string values only. Do not return empty strings. No markdown fences, no commentary.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const result = await generateText(
+    button,
+    `${options.system}\nReturn JSON only.`,
+    prompt,
+    options.maxOutputTokens ?? 1200,
+  );
+  if (!result) return;
+  const parsed = extractJsonObject(result);
+  if (!parsed) {
+    showBanner(
+      "warning",
+      "Fill blanks could not read the answer",
+      "The Small Model did not return usable JSON. Try again, or fill the empty fields by hand.",
+    );
+    return;
+  }
+  const values = fillValuesFromJson(parsed, missing);
+  if (!Object.keys(values).length) {
+    showBanner(
+      "warning",
+      "Fill blanks came back empty",
+      "The Small Model returned no usable fields. Try again, or fill the empty fields by hand.",
+    );
+    return;
+  }
+  let applied: number | boolean | void;
+  try {
+    applied = apply(values);
+  } catch (error) {
+    notifyError(error, "Filling blank fields");
+    return;
+  }
+  if (applied === false) return;
+  const parsedCount = Object.keys(values).length;
+  const appliedCount =
+    typeof applied === "number" ? Math.min(parsedCount, Math.max(0, Math.floor(applied))) : parsedCount;
+  if (appliedCount <= 0) return;
+  const left = Math.max(0, missing.length - appliedCount);
+  toast(
+    "success",
+    `Filled ${appliedCount} field${appliedCount === 1 ? "" : "s"}${left > 0 ? `; ${left} left blank` : ""}.`,
+  );
+}
+
+
 async function readOptional(path: string): Promise<string | null> {
   try {
     const { content } = await host.readFile(normalizeGuestPath(path));
@@ -2213,6 +2300,81 @@ function buildSliceForge(parent: HTMLElement): void {
   };
 
   const actions = addActions(parent);
+  let filling = false;
+  const fill = addButton(actions, "Fill blanks", "outline", () => {
+    if (filling) return;
+    filling = true;
+    void (async () => {
+      if (!sliceState.goal.trim() && !sliceState.constraints.trim() && !sliceState.scan) {
+        toast("info", "Add a goal or constraint first, or turn on project scan.");
+        return;
+      }
+      if (sliceState.goal.trim() && sliceState.constraints.trim()) {
+        toast("info", "Nothing to fill in the slice brief.");
+        return;
+      }
+      const stack = await gatherScan();
+      const context = [
+        `Slice type: ${sliceState.mode}`,
+        sliceState.small ? "Keep the slice to 3 to 5 small steps." : "Use as many steps as the work needs.",
+        stack ? `Project scan:\n${stack}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      await fillMissingFields(
+        fill,
+        {
+          noun: "slice brief",
+          system: [
+            "You fill a short slice brief for a coding assistant.",
+            "Write one concrete, testable goal and practical constraints: stack, scope, time, things not to touch, definition of done.",
+            "Do not plan the whole project. Do not invent file paths or commands; keep names generic when unknown.",
+          ].join("\n"),
+          context,
+          maxOutputTokens: 1000,
+          fields: [
+            {
+              key: "goal",
+              label: "Goal",
+              value: sliceState.goal,
+              max: 900,
+              hint: "one vertical slice with a visible result",
+            },
+            {
+              key: "constraints",
+              label: "Constraints",
+              value: sliceState.constraints,
+              max: 700,
+              hint: "stack, time, scope, things not to touch, definition of done",
+            },
+          ],
+        },
+        (values) => {
+          let applied = 0;
+          if (values.goal !== undefined && !sliceState.goal.trim()) {
+            sliceState.goal = values.goal;
+            handles["slice-goal"]?.update({ value: values.goal });
+            applied += 1;
+          }
+          if (values.constraints !== undefined && !sliceState.constraints.trim()) {
+            sliceState.constraints = values.constraints;
+            handles["slice-constraints"]?.update({ value: values.constraints });
+            applied += 1;
+          }
+          if (applied === 0) {
+            toast("info", "The empty fields were filled while the answer was running; nothing was overwritten.");
+            return false;
+          }
+          sliceState.result = "";
+          clearPowerResult("slice");
+          refreshAll();
+          return applied;
+        },
+      );
+    })().finally(() => {
+      filling = false;
+    });
+  });
   const forge = addButton(actions, "Forge slice", "default", () => {
     void withBusy(forge, async () => {
       if (!sliceState.goal.trim()) {
@@ -2278,7 +2440,7 @@ function buildSliceForge(parent: HTMLElement): void {
   });
   addNote(
     parent,
-    "Forge slice uses the Small Model and waits for one complete answer. Forge in chat hands the same brief to the chat agent, which streams, can read the repo, and is not bound by the panel's one-shot generation call.",
+    "Forge slice uses the Small Model and waits for one complete answer. Forge in chat hands the same brief to the chat agent, which streams, can read the repo, and is not bound by the panel's one-shot generation call. Fill blanks is a separate Small Model call: it only writes empty goal or constraint fields and is never run by Forge in chat or Send to agent.",
   );
 
   const { node: resultHost, set: setResult } = addResult(parent);
@@ -2789,6 +2951,72 @@ function buildGameFeel(parent: HTMLElement): void {
   handles["game-mechanic"] = mechanic;
 
   const actions = addActions(parent);
+  const fill = addButton(actions, "Fill blanks", "outline", () => {
+    void fillMissingFields(
+      fill,
+      {
+        noun: "game-feel brief",
+        system: [
+          "You fill a game-feel design brief.",
+          "Name concrete motion, sound, camera, and timing choices. Avoid generic 'add juice' advice. Keep each field useful to a small implementation pass.",
+        ].join("\n"),
+        context: [
+          `Genre: ${gameState.genre}`,
+          `Engine: ${gameState.engine}`,
+          `Workbench: ${gameState.workbench}`,
+        ].join("\n"),
+        maxOutputTokens: 900,
+        fields: [
+          {
+            key: "loop",
+            label: "Core loop",
+            value: gameState.loop,
+            max: 700,
+            hint: "the repeatable player action and reward",
+          },
+          {
+            key: "feel",
+            label: "Target feel",
+            value: gameState.feel,
+            max: 500,
+            hint: "crunchy, weighty, floaty, tense, toy-like",
+          },
+          {
+            key: "mechanic",
+            label: "Mechanic under the knife",
+            value: gameState.mechanic,
+            max: 700,
+            hint: "the jump, hit, pickup, boss phase, or other event to tune",
+          },
+        ],
+      },
+      (values) => {
+        let applied = 0;
+        if (values.loop !== undefined && !gameState.loop.trim()) {
+          gameState.loop = values.loop.slice(0, 1500);
+          handles["game-loop"]?.update({ value: gameState.loop });
+          applied += 1;
+        }
+        if (values.feel !== undefined && !gameState.feel.trim()) {
+          gameState.feel = values.feel.slice(0, 1200);
+          handles["game-feel"]?.update({ value: gameState.feel });
+          applied += 1;
+        }
+        if (values.mechanic !== undefined && !gameState.mechanic.trim()) {
+          gameState.mechanic = values.mechanic.slice(0, 1600);
+          handles["game-mechanic"]?.update({ value: gameState.mechanic });
+          applied += 1;
+        }
+        if (applied === 0) {
+          toast("info", "The empty fields were filled while the answer was running; nothing was overwritten.");
+          return false;
+        }
+        gameState.result = "";
+        clearPowerResult("game");
+        return applied;
+      },
+    );
+  });
   const design = addButton(actions, "Design the pass", "default", () => {
     void withBusy(design, async () => {
       const system = [
@@ -2842,6 +3070,8 @@ function buildGameFeel(parent: HTMLElement): void {
       }
     });
   });
+
+  addNote(parent, "Fill blanks asks the Small Model for only the empty design fields. It is separate from the Send to agent action below.");
 
   const { node: resultHost, set: setResult } = addResult(parent);
   resultClearers["game"] = () => setResult("");
@@ -3143,6 +3373,52 @@ function buildCharacterForge(parent: HTMLElement): void {
   };
   resultClearers["character"] = clearResult;
   const actions = addActions(parent);
+  const fill = addButton(actions, "Fill blanks", "outline", () => {
+    const character = ensureCharacter();
+    void fillMissingFields(
+      fill,
+      {
+        noun: "character sheet",
+        system: [
+          "You fill character sheets for fiction.",
+          "Write specific, playable details: concrete behavior, costs, contradictions, and voice. Keep name, role, pronouns, and era short; put texture in look, want, need, wound, contradiction, and voice. Avoid generic traits, stock phrases, and long backstory.",
+        ].join("\n"),
+        fields: fields.map((field) => ({
+          key: field.key,
+          label: field.label,
+          value: String(character[field.key] ?? ""),
+          max: field.key === "look" || field.key === "relationships" ? 1200 : 600,
+          hint: field.helper,
+        })),
+        maxOutputTokens: 2400,
+      },
+      (values) => {
+        if (selectedCharacterId !== character.id) {
+          toast("info", "Character changed; the fill was discarded.");
+          return false;
+        }
+        let applied = 0;
+        for (const [key, value] of Object.entries(values)) {
+          if (!fields.some((field) => field.key === key)) continue;
+          if (String((character as any)[key] ?? "").trim()) continue;
+          (character as any)[key] = value;
+          fieldHandles.get(key as keyof Character)?.update({ value });
+          applied += 1;
+        }
+        if (applied === 0) {
+          toast("info", "The empty fields were filled while the answer was running; nothing was overwritten.");
+          return false;
+        }
+        character.updatedAt = Date.now();
+        charState.result = "";
+        clearResult();
+        markCharactersChanged();
+        if (values.name) renderSelect();
+        refreshAll();
+        return applied;
+      },
+    );
+  });
   const preview = addButton(actions, "Preview card", "secondary", () => {
     const card = characterCard(ensureCharacter());
     charState.result = card;
@@ -3184,6 +3460,8 @@ function buildCharacterForge(parent: HTMLElement): void {
       `${card}\n\nStart a scene with this character. Put them under pressure that targets their contradiction. Open with them pursuing their want and failing in a small, specific way. Stay close to their voice. End on a turn, not a summary.`,
     );
   });
+
+  addNote(parent, "Fill blanks asks the Small Model for only the empty fields. It does not start a chat or overwrite text you have already typed.");
 
   syncFields();
 }
@@ -3502,7 +3780,75 @@ function buildIdeaDistiller(parent: HTMLElement): void {
     renderSparks();
     refreshAll();
   });
+  let filling = false;
+  const fill = addButton(addRow, "Fill blanks", "outline", () => {
+    if (filling) return;
+    filling = true;
+    void (async () => {
+      if (ideaState.title.trim() && ideaState.note.trim()) {
+        toast("info", "Nothing to fill in the idea spark.");
+        return;
+      }
+      let context = "";
+      try {
+        const info = await detectProject();
+        context = `Project: ${info.label}\n${info.summary}`;
+      } catch {
+        // A project scan is optional; the fill still works without one.
+      }
+      await fillMissingFields(
+        fill,
+        {
+          noun: "idea spark",
+          system: [
+            "You write terse, concrete game or software ideas.",
+            "Avoid generic advice, buzzwords, and long explanations. A title should make the reader curious; a note should say what it is, why it might work, and what would make it fun.",
+          ].join("\n"),
+          context,
+          maxOutputTokens: 500,
+          fields: [
+            {
+              key: "title",
+              label: "Title",
+              value: ideaState.title,
+              max: 120,
+              hint: "one line that makes the reader curious",
+            },
+            {
+              key: "note",
+              label: "Note",
+              value: ideaState.note,
+              max: 700,
+              hint: "what it is, why now, what would make it fun",
+            },
+          ],
+        },
+        (values) => {
+          let applied = 0;
+          if (values.title !== undefined && !ideaState.title.trim()) {
+            ideaState.title = values.title.slice(0, 160);
+            handles["idea-title"]?.update({ value: ideaState.title });
+            applied += 1;
+          }
+          if (values.note !== undefined && !ideaState.note.trim()) {
+            ideaState.note = values.note.slice(0, NOTE_MAX);
+            handles["idea-note"]?.update({ value: ideaState.note });
+            applied += 1;
+          }
+          if (applied === 0) {
+            toast("info", "The empty fields were filled while the answer was running; nothing was overwritten.");
+            return false;
+          }
+          addButtonHandle?.update({ disabled: !ideaState.title.trim() });
+          return applied;
+        },
+      );
+    })().finally(() => {
+      filling = false;
+    });
+  });
   addButtonHandle.update({ disabled: true });
+  addNote(parent, "Fill blanks asks the Small Model for the missing title or note only; it does not save or send the spark.");
 
   group(parent, "The rack");
   const list = el("div", "fb-scroll");

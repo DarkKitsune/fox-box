@@ -58,6 +58,8 @@ Folder installs run from the folder, so rebuild and reload after changes. A Git 
 
 Chat, selection, file, and diff menu actions feed captured material into the relevant panel.
 
+**Fill blanks** appears on the creative forms in Character Forge, Idea Distiller, and Game Feel Lab, and on the Slice Forge brief. It asks the Small Model for only the fields left empty. It is a separate Small Model call and is not run by actions that send work to the full agent.
+
 ## How pruning is measured
 
 Fox Box counts characters in the outgoing text, tool results, and tool arguments before and after it edits the request. Those counts are exact.
@@ -69,16 +71,17 @@ Token counts are estimates. When OpenChamber's context meter has a measurement, 
 ## Development and testing
 
 ```bash
-npm run check          # typecheck, plugin tests, build, manifest check
+npm run check          # typecheck, plugin tests, panel tests, build, manifest check
 npm run build          # rebuild panel/main.js
 npm run typecheck
 npm run test:plugin
+npm run test:panel
 npm run check:manifest
 ```
 
 `panel/main.js` is committed because the extension loads it directly. Rebuild it after editing `panel/main.ts`.
 
-The tests focus on the OpenCode plugin: request injection, tool hiding, context pruning, protection rules, and ledger accounting. The panel has less automated coverage.
+The plugin tests cover request injection, tool hiding, context pruning, protection rules, and ledger accounting. The panel tests cover the Fill blanks JSON parsing; the rest of the panel has less automated coverage.
 
 ## Status
 

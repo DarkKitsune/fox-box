@@ -366,6 +366,16 @@
 
       const generatedText = (prompt) => {
         generated += 1;
+        if (/Fill the empty fields of this/i.test(prompt)) {
+          const keys = [...prompt.matchAll(/^\s*"([^"]+)"\s*:\s*"string"\s*,?\s*$/gm)].map(
+            (match) => match[1],
+          );
+          if (keys.length) {
+            return JSON.stringify(
+              Object.fromEntries(keys.map((key) => [key, `Mock ${key.replace(/[_-]+/g, " ")}`])),
+            );
+          }
+        }
         if (/handoff/i.test(prompt)) {
           return "# Handoff\n## Goal\nShip the Fox Box panel.\n## Current state\nPanel is mounted and the mock host answers.\n## Decisions\nKeep the plugin tool-free.\n## Files and commands\npanel/main.ts, plugin/index.js; npm run check.\n## Open threads\nVisual pass on narrow width.\n## Next three moves\n1. Fix runtime errors.\n2. Check mobile wrap.\n3. Rebuild the bundle.\n## Do not\nDo not add duplicate tools.";
         }

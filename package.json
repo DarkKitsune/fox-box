@@ -8,8 +8,9 @@
     "build": "esbuild panel/main.ts --bundle --format=iife --platform=browser --target=chrome120 --outfile=panel/main.js",
     "typecheck": "tsc --noEmit",
     "test:plugin": "node scripts/test-plugin.mjs",
+    "test:panel": "node scripts/test-panel.mjs",
     "check:manifest": "node scripts/check-manifest.mjs",
-    "check": "npm run typecheck && npm run test:plugin && npm run build && npm run check:manifest"
+    "check": "npm run typecheck && npm run test:plugin && npm run test:panel && npm run build && npm run check:manifest"
   },
   "openchamber": {
     "apiVersion": 1,

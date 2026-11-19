@@ -24,7 +24,7 @@ Requires OpenChamber 2.7.0 or newer and OpenCode 2.x.
    https://github.com/DarkKitsune/fox-box
    ```
 
-4. Approve the requested capabilities: `prompt`, `sessions`, `files`, `model`, and the bundled OpenCode plugin.
+4. Approve the requested capabilities: `prompt`, `sessions`, `files`, `model`, `conversation` (the Handoff Passport's captured chat), `filesystem` (the config and status files under `~/.config/openchamber/fox-box/`), and the bundled OpenCode plugin.
 
 Folder installs run from the folder, so rebuild and reload after changes. A Git install copies the built package into OpenChamber's data folder.
 
@@ -32,7 +32,8 @@ Folder installs run from the folder, so rebuild and reload after changes. A Git 
 
 ### Context
 
-- **Context Keeper** edits the outgoing request only; stored history is untouched. It can collapse repeated reads, cap old and fresh tool output, and leave skills, pinned paths, and recent reads protected. The limits are configurable.
+- **Context Keeper** edits the outgoing request only; stored history is untouched. It can collapse repeated reads, supersede older reads of the same file, mark reads stale after an edit, merge overlapping read ranges, turn old write/edit payloads into receipts, compact old logs/diffs/traces/search results/JSON/CSV/web pages/code reads, enforce a whole-request budget, and leave skills, pinned paths, and recent reads protected. The limits and passes are configurable.
+- **Skill protection** covers `SKILL.md`, every file inside a `skills/` or `skill/` folder (including JSON schemas and manifests), and skill JSON files such as `skill.json`, `skills.json`, and `skill-config.json`. Older copies can be pruned after a re-read, but at least one whole copy of a protected skill file always survives compaction, size caps, duplicate collapse, stale invalidation, and budget eviction.
 - **Handoff Passport** turns a captured chat into a compact handoff: goal, current state, decisions, files, open threads, next moves, and things not to repeat. It can start a fresh session from the result.
 
 ### Build
@@ -54,7 +55,7 @@ Folder installs run from the folder, so rebuild and reload after changes. A Git 
 
 ### Metrics
 
-- **Pruning Ledger** reports exact character counts, an estimated token count, the latest request's savings, a breakdown by cause, recent request history, and per-session totals.
+- **Pruning Ledger** reports exact character counts, an estimated token count, the latest request's savings, a breakdown by cause (aged, fresh, duplicates, superseded, stale, compactors, receipts, budget), recent request history, per-session totals, and a whole-request anatomy line for system, tools, text, reasoning, media, and tool payloads.
 
 Chat, selection, file, and diff menu actions feed captured material into the relevant panel.
 
@@ -62,11 +63,11 @@ Chat, selection, file, and diff menu actions feed captured material into the rel
 
 ## How pruning is measured
 
-Fox Box counts characters in the outgoing text, tool results, and tool arguments before and after it edits the request. Those counts are exact.
+Fox Box counts characters in the outgoing text, tool results, and tool arguments before and after it edits the request. Those counts are exact for the conversation; the ledger also measures the whole request separately, including the system prompt, tool definitions, reasoning parts, and media bytes.
 
 The headline counters describe the **latest guarded request**. The cumulative value is **input saved over time**: a chat re-sends its history every turn, so the same text can be pruned again on later turns. It is not a unique-character count.
 
-Token counts are estimates. When OpenChamber's context meter has a measurement, Fox Box uses the model's measured tokens per character; otherwise it falls back to four characters per token.
+Token counts are estimates. When OpenChamber's context meter has a measurement, Fox Box uses the model's measured tokens per character; otherwise it falls back to four characters per token. The panel carries that measured ratio into the config when it saves, so the plugin's request budget uses the same ratio.
 
 ## Development and testing
 
@@ -75,13 +76,15 @@ npm run check          # typecheck, plugin tests, panel tests, build, manifest c
 npm run build          # rebuild panel/main.js
 npm run typecheck
 npm run test:plugin
+npm run test:context
+npm run test:context:audit
 npm run test:panel
 npm run check:manifest
 ```
 
 `panel/main.js` is committed because the extension loads it directly. Rebuild it after editing `panel/main.ts`.
 
-The plugin tests cover request injection, tool hiding, context pruning, protection rules, and ledger accounting. The panel tests cover the Fill blanks JSON parsing; the rest of the panel has less automated coverage.
+The plugin tests cover request injection, tool hiding, context pruning, protection rules, and ledger accounting. The context tests cover measurement (including both media shapes), path supersession, stale reads, overlap merging, edit receipts, each type-aware compactor and its source-file guards, error and JSON size caps, the global budget, relevance ordering, malformed model output, random fuzz input, and skill protection. A separate adversarial audit covers frozen parts, circular structures, duplicate ids, partial skill re-reads, and accounting invariants. The panel tests cover the Fill blanks JSON parsing; the rest of the panel has less automated coverage.
 
 ## Status
 
@@ -93,7 +96,7 @@ Expect rough edges. Use it on work you can afford to redo, keep projects under v
 
 ```text
 panel/      OpenChamber panel, TypeScript and its built bundle
-plugin/     OpenCode plugin that edits outgoing requests
+plugin/     OpenCode plugin that edits outgoing requests; context-core.js and context.js hold the pruning engine
 scripts/    Manifest check, plugin tests, panel preview
 assets/     Extension icon
 ```

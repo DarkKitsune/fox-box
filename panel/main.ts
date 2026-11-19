@@ -18,7 +18,7 @@ import { extractJsonObject, fillValuesFromJson, type FillField } from "./fill";
 /*  Constants and types                                               */
 /* ------------------------------------------------------------------ */
 
-const VERSION = "1.1.1";
+const VERSION = "1.2.0";
 const CONFIG_VERSION = 2;
 const CONFIG_PATH = "~/.config/openchamber/fox-box/config.json";
 /* Older plugin versions wrote one global status; still read it when the project file is absent. */
@@ -50,6 +50,16 @@ type ContextPower = {
   maxToolOutput: number;
   maxOldToolOutput: number;
   protectPaths: string;
+  pathSupersession: boolean;
+  staleReads: boolean;
+  mergeReadRanges: boolean;
+  editReceipts: boolean;
+  receiptMinChars: number;
+  smartCompaction: boolean;
+  skeletonCodeReads: boolean;
+  budgetTokens: number;
+  charsPerToken: number;
+  relevanceScoring: boolean;
   briefs: Record<string, string>;
 };
 
@@ -129,6 +139,16 @@ type PluginTotals = {
   otherChars?: number;
   toolResults?: number;
   trimmedResults?: number;
+  supersededChars?: number;
+  staleChars?: number;
+  compactedChars?: number;
+  receiptChars?: number;
+  budgetChars?: number;
+  superseded?: number;
+  stale?: number;
+  compacted?: number;
+  receipts?: number;
+  budgetEvicted?: number;
 };
 
 type PluginSessionMetrics = {
@@ -156,7 +176,49 @@ type PluginSessionMetrics = {
   lastOther?: number;
   lastToolResults?: number;
   lastTrimmedResults?: number;
+  supersededChars?: number;
+  staleChars?: number;
+  compactedChars?: number;
+  receiptChars?: number;
+  budgetChars?: number;
+  superseded?: number;
+  stale?: number;
+  compacted?: number;
+  receipts?: number;
+  budgetEvicted?: number;
+  lastSuperseded?: number;
+  lastSupersededChars?: number;
+  lastStale?: number;
+  lastStaleChars?: number;
+  lastCompacted?: number;
+  lastCompactedChars?: number;
+  lastReceipts?: number;
+  lastReceiptChars?: number;
+  lastBudgetEvicted?: number;
+  lastBudgetChars?: number;
+  lastMeasure?: RequestMeasure;
   history?: Array<{ at?: number; saved?: number; kept?: number }>;
+};
+
+type RequestMeasure = {
+  chars?: number;
+  textChars?: number;
+  estimatedTokens?: number;
+  system?: number;
+  toolDefinitions?: number;
+  text?: number;
+  reasoning?: number;
+  media?: number;
+  toolInputs?: number;
+  toolResults?: number;
+  other?: number;
+  messages?: number;
+  toolCalls?: number;
+  toolResultParts?: number;
+  toolDefinitionCount?: number;
+  mediaParts?: number;
+  reasoningParts?: number;
+  largestToolDefinitions?: Array<{ name?: string; chars?: number }>;
 };
 
 type PluginStatus = {
@@ -187,6 +249,22 @@ type PluginStatus = {
     otherChars?: number;
     toolResults?: number;
     trimmedResults?: number;
+    superseded?: number;
+    merged?: number;
+    supersededChars?: number;
+    stale?: number;
+    staleChars?: number;
+    compacted?: number;
+    compactedChars?: number;
+    receipts?: number;
+    receiptChars?: number;
+    budgetEvicted?: number;
+    budgetChars?: number;
+    budgetOver?: number;
+    pruneErrors?: number;
+    requestChars?: number;
+    requestTokens?: number;
+    measure?: RequestMeasure;
     at?: number;
   };
 };
@@ -302,6 +380,9 @@ let statusKey = "";
 let currentSessionRecord: any = null;
 let sessionsStop: (() => void) | null = null;
 let sessionsToken = 0;
+let sessionsRetryTimer: number | undefined;
+let projectRetryTimer: number | undefined;
+let projectRetryDelay = 5000;
 let projectId: string | null = null;
 let projectKey = "";
 let lastDirectory = "";
@@ -660,6 +741,16 @@ function defaultConfig(): FoxConfig {
         maxToolOutput: 48000,
         maxOldToolOutput: 6000,
         protectPaths: "",
+        pathSupersession: true,
+        staleReads: true,
+        mergeReadRanges: true,
+        editReceipts: true,
+        receiptMinChars: 1200,
+        smartCompaction: true,
+        skeletonCodeReads: true,
+        budgetTokens: 0,
+        charsPerToken: 4,
+        relevanceScoring: true,
         briefs: {},
       },
       model: {
@@ -743,6 +834,31 @@ function mergeConfig(input: any): FoxConfig {
           base.powers.context.maxOldToolOutput,
         ),
         protectPaths: typeof context.protectPaths === "string" ? context.protectPaths.slice(0, 4000) : "",
+        pathSupersession: context.pathSupersession !== false,
+        staleReads: context.staleReads !== false,
+        mergeReadRanges: context.mergeReadRanges !== false,
+        editReceipts: context.editReceipts !== false,
+        receiptMinChars: clampInt(
+          context.receiptMinChars ?? base.powers.context.receiptMinChars,
+          200,
+          20000,
+          base.powers.context.receiptMinChars,
+        ),
+        smartCompaction: context.smartCompaction !== false,
+        skeletonCodeReads: context.skeletonCodeReads !== false,
+        budgetTokens: clampInt(
+          context.budgetTokens ?? base.powers.context.budgetTokens,
+          0,
+          2_000_000,
+          base.powers.context.budgetTokens,
+        ),
+        charsPerToken: clampNumber(
+          context.charsPerToken ?? base.powers.context.charsPerToken,
+          1,
+          20,
+          base.powers.context.charsPerToken,
+        ),
+        relevanceScoring: context.relevanceScoring !== false,
         briefs,
       },
       model: {
@@ -797,9 +913,12 @@ let saveAgain = false;
 let configLoaded = false;
 let configNewer = false;
 let configSaveWarned = false;
+let configPending = false;
+let configSavePromise: Promise<void> = Promise.resolve();
 
 function queueConfigSave(): void {
   setFooter("Saving rules…");
+  configPending = true;
   if (configTimer !== undefined) window.clearTimeout(configTimer);
   configTimer = window.setTimeout(() => {
     configTimer = undefined;
@@ -807,7 +926,7 @@ function queueConfigSave(): void {
   }, 320);
 }
 
-async function saveConfigNow(): Promise<void> {
+function saveConfigNow(): Promise<void> {
   if (!configLoaded || configNewer) {
     setFooter("Rules not saved");
     if (!configSaveWarned) {
@@ -820,33 +939,38 @@ async function saveConfigNow(): Promise<void> {
           : "Fox Box could not load its config file, so it will not overwrite it. Fix or remove ~/.config/openchamber/fox-box/config.json, or approve Fox Box's file access in Settings → Extensions, then reopen the panel.",
       );
     }
-    return;
+    return configSavePromise;
   }
   if (savingConfig) {
     saveAgain = true;
-    return;
+    return configSavePromise;
   }
   savingConfig = true;
-  try {
-    do {
-      saveAgain = false;
-      const snapshot = JSON.stringify(config, null, 2);
-      try {
-        await host.writeFile(CONFIG_PATH, snapshot);
-        setFooter("Rules saved");
-      } catch (error) {
-        setFooter("Rules not saved");
-        notifyError(error, "Saving rules");
-        if (saveAgain) {
-          saveAgain = false;
-          queueConfigSave();
+  configSavePromise = (async () => {
+    try {
+      do {
+        saveAgain = false;
+        syncMeasuredRatio();
+        const snapshot = JSON.stringify(config, null, 2);
+        try {
+          await host.writeFile(CONFIG_PATH, snapshot);
+          setFooter("Rules saved");
+          if (!saveAgain) configPending = false;
+        } catch (error) {
+          setFooter("Rules not saved");
+          notifyError(error, "Saving rules");
+          if (saveAgain) {
+            saveAgain = false;
+            queueConfigSave();
+          }
+          return;
         }
-        return;
-      }
-    } while (saveAgain);
-  } finally {
-    savingConfig = false;
-  }
+      } while (saveAgain);
+    } finally {
+      savingConfig = false;
+    }
+  })();
+  return configSavePromise;
 }
 
 async function loadConfig(): Promise<void> {
@@ -884,9 +1008,12 @@ async function loadConfig(): Promise<void> {
       }
       return;
     }
-    config = defaultConfig();
+    /*
+     * Keep the current in-memory rules on any other failure (permission, timeout,
+     * malformed file). Replacing them with defaults here silently discarded edits
+     * made since the last successful load.
+     */
     configLoaded = false;
-    configNewer = false;
     setFooter("Local rules only");
     if (errorCode(error) !== "NOT_GRANTED") notifyError(error, "Loading rules");
   }
@@ -938,7 +1065,9 @@ const FALLBACK_TOKENS_PER_CHAR = 0.25;
 function tokenEstimate(): { perChar: number; measured: boolean } {
   const last = pluginStatus?.last;
   const tokens = amount(currentSessionRecord?.context?.tokens);
-  const chars = amount(last?.keptChars);
+  /* The meter counts the whole request; prefer the whole-request text count
+     when the plugin reports it, and fall back to the conversation count. */
+  const chars = amount(last?.measure?.textChars) || amount(last?.keptChars);
   if (
     !config.powers.context.enabled ||
     !last ||
@@ -957,6 +1086,17 @@ function tokenEstimate(): { perChar: number; measured: boolean } {
 
 function tokensForChars(chars: number, estimate = tokenEstimate()): number {
   return Math.round(Math.max(0, chars) * estimate.perChar);
+}
+
+/*
+ * The plugin cannot see OpenChamber's context meter, so carry the measured
+ * characters-per-token ratio into config.json whenever the panel saves. The
+ * request budget then uses this model's real ratio instead of the 4-char fallback.
+ */
+function syncMeasuredRatio(): void {
+  const estimate = tokenEstimate();
+  if (!estimate.measured) return;
+  config.powers.context.charsPerToken = clampNumber(1 / estimate.perChar, 1, 20, 4);
 }
 
 /*
@@ -1624,8 +1764,20 @@ async function fillMissingFields(
 
 
 async function readOptional(path: string): Promise<string | null> {
+  /*
+   * Guest file paths are project-relative. An absolute path from a stack trace must
+   * be made relative first; sending "C:/repo/x" as-is is read as a project path on
+   * some hosts and fails on others.
+   */
+  let target = normalizeGuestPath(path);
+  if (path.startsWith("/") || path.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(path)) {
+    const relative = relativeToProject(path);
+    if (!relative) return null;
+    target = normalizeGuestPath(relative);
+  }
+  if (!target || target.split("/").includes("..")) return null;
   try {
-    const { content } = await host.readFile(normalizeGuestPath(path));
+    const { content } = await host.readFile(target);
     return content;
   } catch {
     return null;
@@ -1797,7 +1949,7 @@ function buildContextKeeper(parent: HTMLElement): void {
   addSwitch(
     protection,
     "Shield skill files",
-    "The newest read of a SKILL.md, a skill-tool result, or a pinned path stays whole until that exact read is replaced by a newer one.",
+    "The newest copy of SKILL.md, any file in a skills/ or skill/ folder, a skill JSON manifest, a skill-tool result, or a pinned path stays whole. Older copies can be pruned after a re-read.",
     () => config.powers.context.protectSkills,
     (value) => {
       config.powers.context.protectSkills = value;
@@ -1913,6 +2065,96 @@ function buildContextKeeper(parent: HTMLElement): void {
     },
   );
 
+  const advanced = group(parent, "Advanced pruning");
+  addSwitch(
+    advanced,
+    "Supersede older reads",
+    "When a file is read again, the newest read wins. Older reads whose line range is fully covered by newer reads become a short pointer; partial overlaps are merged instead.",
+    () => config.powers.context.pathSupersession,
+    (value) => {
+      config.powers.context.pathSupersession = value;
+    },
+  );
+  addSwitch(
+    advanced,
+    "Mark stale reads",
+    "A read from before a later successful edit is marked stale. A skill or pinned file always keeps one copy, even when it was not re-read after the edit.",
+    () => config.powers.context.staleReads,
+    (value) => {
+      config.powers.context.staleReads = value;
+    },
+  );
+  addSwitch(
+    advanced,
+    "Merge overlapping ranges",
+    "When two reads of the same file share lines, the older copy drops the repeated lines and keeps the rest. Used only when the newer read is recent enough to survive the size caps.",
+    () => config.powers.context.mergeReadRanges,
+    (value) => {
+      config.powers.context.mergeReadRanges = value;
+    },
+  );
+  addSwitch(
+    advanced,
+    "Edit receipts",
+    "Older large write/edit/patch arguments become path, +N/-M, hash, and hunk count. The latest edit for each file stays intact, and the file on disk remains the source of truth.",
+    () => config.powers.context.editReceipts,
+    (value) => {
+      config.powers.context.editReceipts = value;
+    },
+  );
+  addSwitch(
+    advanced,
+    "Type-aware compactors",
+    "Old test logs, stack traces, diffs, grep/glob lists, JSON/CSV, and web pages are reduced to their useful shape before the size caps run.",
+    () => config.powers.context.smartCompaction,
+    (value) => {
+      config.powers.context.smartCompaction = value;
+    },
+  );
+  addSwitch(
+    advanced,
+    "Code read skeletons",
+    "Old source reads keep imports, signatures, and top-level declarations while eliding function bodies. Only applied to large reads of known code files.",
+    () => config.powers.context.skeletonCodeReads,
+    (value) => {
+      config.powers.context.skeletonCodeReads = value;
+    },
+  );
+  const advancedGrid = el("div", "fb-grid2");
+  advanced.append(advancedGrid);
+  addSelect(
+    advancedGrid,
+    "Request budget",
+    [
+      { id: "0", label: "Off", hint: "size caps only" },
+      { id: "8000", label: "8k tokens" },
+      { id: "16000", label: "16k tokens" },
+      { id: "24000", label: "24k tokens" },
+      { id: "32000", label: "32k tokens" },
+      { id: "48000", label: "48k tokens" },
+      { id: "64000", label: "64k tokens" },
+      { id: "96000", label: "96k tokens" },
+      { id: "128000", label: "128k tokens" },
+    ],
+    () => String(config.powers.context.budgetTokens),
+    (value) => {
+      config.powers.context.budgetTokens = Number(value) || 0;
+    },
+  );
+  addSwitch(
+    advancedGrid,
+    "Protect relevant context",
+    "When a budget is set, keep files and symbols named in the latest user message and recent turns longer than unrelated old output.",
+    () => config.powers.context.relevanceScoring,
+    (value) => {
+      config.powers.context.relevanceScoring = value;
+    },
+  );
+  addNote(
+    advanced,
+    "Skill protection always covers SKILL.md, every file inside a skills/ or skill/ folder, and skill JSON manifests. Older copies may be pruned after a re-read, but at least one copy of a protected skill file stays whole. The budget is estimated with the measured tokens-per-character ratio when the panel can see it, otherwise four characters per token.",
+  );
+
   group(parent, "Focus brief");
   const brief = addText(
     parent,
@@ -1974,6 +2216,16 @@ function buildContextKeeper(parent: HTMLElement): void {
       `Trim tool output: ${config.powers.context.trimToolOutput ? "on" : "off"}`,
       `Fresh tool cap: ${fmt(config.powers.context.maxToolOutput)} chars`,
       `Old tool budget: ${fmt(config.powers.context.maxOldToolOutput)} chars`,
+      `Supersede older reads: ${config.powers.context.pathSupersession ? "on" : "off"}`,
+      `Merge read overlaps: ${config.powers.context.mergeReadRanges ? "on" : "off"}`,
+      `Stale reads: ${config.powers.context.staleReads ? "on" : "off"}`,
+      `Edit receipts: ${config.powers.context.editReceipts ? "on" : "off"}`,
+      `Type-aware compactors: ${config.powers.context.smartCompaction ? "on" : "off"}`,
+      `Code read skeletons: ${config.powers.context.skeletonCodeReads ? "on" : "off"}`,
+      `Request budget: ${
+        config.powers.context.budgetTokens > 0 ? `${fmt(config.powers.context.budgetTokens)} tokens` : "off"
+      }`,
+      `Relevance protection: ${config.powers.context.relevanceScoring ? "on" : "off"}`,
       `Pinned paths: ${config.powers.context.protectPaths.trim() || "none"}`,
       `Focus brief: ${currentBrief().trim() || "empty"}`,
     ];
@@ -2107,6 +2359,7 @@ function buildHandoff(parent: HTMLElement): void {
   });
 
   const { node: resultHost, set: setResult } = addResult(parent);
+  setResult(handoffState.result);
   resultClearers["handoff"] = () => setResult("");
 
   const resultActions = addActions(parent);
@@ -2444,6 +2697,7 @@ function buildSliceForge(parent: HTMLElement): void {
   );
 
   const { node: resultHost, set: setResult } = addResult(parent);
+  setResult(sliceState.result);
   resultClearers["slice"] = () => setResult("");
   const resultActions = addActions(parent);
   addButton(resultActions, "Send to agent", "secondary", () => {
@@ -2627,6 +2881,7 @@ function buildBugHunter(parent: HTMLElement): void {
   });
 
   const { node: resultHost, set: setResult } = addResult(parent);
+  setResult(bugState.result);
   resultClearers["bug"] = () => setResult("");
   const resultActions = addActions(parent);
   addButton(resultActions, "Send to agent", "secondary", () => {
@@ -2806,6 +3061,7 @@ function buildRedPen(parent: HTMLElement): void {
   });
 
   const { node: resultHost, set: setResult } = addResult(parent);
+  setResult(redState.result);
   resultClearers["red-pen"] = () => setResult("");
   const resultActions = addActions(parent);
   addButton(resultActions, "Send findings", "secondary", () => {
@@ -3074,6 +3330,7 @@ function buildGameFeel(parent: HTMLElement): void {
   addNote(parent, "Fill blanks asks the Small Model for only the empty design fields. It is separate from the Send to agent action below.");
 
   const { node: resultHost, set: setResult } = addResult(parent);
+  setResult(gameState.result);
   resultClearers["game"] = () => setResult("");
   const resultActions = addActions(parent);
   addButton(resultActions, "Send to agent", "secondary", () => {
@@ -3125,7 +3382,11 @@ function ensureCharacter(): Character {
   const existing = selectedCharacter();
   if (existing) return existing;
   const created = characters[0] ?? blankCharacter();
-  if (!characters.length) characters.push(created);
+  if (!characters.length) {
+    characters.push(created);
+    /* The badge reports saved characters, so a new blank must really be stored. */
+    markCharactersChanged();
+  }
   selectedCharacterId = created.id;
   return created;
 }
@@ -3134,43 +3395,71 @@ let charactersSaving = false;
 let charactersSavePending = false;
 let charactersTouched = false;
 let charactersVersion = 0;
+let charactersLoaded = false;
+let charactersSaveWarned = false;
+let charactersSaveChain: Promise<void> = Promise.resolve();
+/* Records whose read failed are kept in the index so a later save cannot orphan them. */
+const retainedCharacterIds = new Set<string>();
 
-function saveCharactersNow(): void {
-  if (charactersSaving) {
-    charactersSavePending = true;
-    return;
+function characterIndexIds(snapshot: Character[]): string[] {
+  const ids = snapshot.map((character) => character.id);
+  for (const id of retainedCharacterIds) {
+    if (!ids.includes(id) && ids.length < 40) ids.push(id);
   }
-  charactersSaving = true;
-  const version = charactersVersion;
-  const snapshot = characters.slice(0, 40).map((character) => ({ ...character }));
-  void (async () => {
+  return ids.slice(0, 40);
+}
+
+async function runCharactersSave(): Promise<void> {
+  do {
+    charactersSavePending = false;
+    const version = charactersVersion;
+    const snapshot = characters.slice(0, 40).map((character) => ({ ...character }));
     let ok = false;
     const nextCache = new Map<string, string>();
     const writes: Array<Promise<unknown>> = [];
     for (const character of snapshot) {
       const serialized = JSON.stringify(character);
       nextCache.set(character.id, serialized);
+      retainedCharacterIds.delete(character.id);
       if (characterCache.get(character.id) !== serialized) {
-        writes.push(host.storage.set(characterKey(character.id), character));
+        /* Storage validates JSON strictly: undefined properties are rejected. */
+        writes.push(host.storage.set(characterKey(character.id), JSON.parse(serialized)));
       }
     }
     try {
       await Promise.all(writes);
-      await host.storage.set(CHARACTER_INDEX_KEY, snapshot.map((character) => character.id));
+      await host.storage.set(CHARACTER_INDEX_KEY, characterIndexIds(snapshot));
       characterCache.clear();
       for (const [id, serialized] of nextCache) characterCache.set(id, serialized);
       ok = true;
     } catch {
       toast("error", "Could not save characters.");
-    } finally {
-      charactersSaving = false;
-      if (ok && charactersVersion === version) charactersTouched = false;
-      if (charactersSavePending) {
-        charactersSavePending = false;
-        persistCharacters();
-      }
     }
-  })();
+    if (!ok) return;
+    if (charactersVersion === version && !charactersSavePending) {
+      charactersTouched = false;
+      return;
+    }
+  } while (charactersLoaded);
+}
+
+function saveCharactersNow(): Promise<void> {
+  if (!charactersLoaded) {
+    if (!charactersSaveWarned) {
+      charactersSaveWarned = true;
+      toast("error", "Saved characters could not be read, so Fox Box will not overwrite them. Reopen the panel.");
+    }
+    return charactersSaveChain;
+  }
+  if (charactersSaving) {
+    charactersSavePending = true;
+    return charactersSaveChain;
+  }
+  charactersSaving = true;
+  charactersSaveChain = runCharactersSave().finally(() => {
+    charactersSaving = false;
+  });
+  return charactersSaveChain;
 }
 
 const persistCharacters = debounce(saveCharactersNow, 450);
@@ -3213,6 +3502,7 @@ function buildCharacterForge(parent: HTMLElement): void {
   const selectHost = el("div", "fb-actions-grow");
   top.append(selectHost);
   let selectHandle: Handle | null = null;
+  let nameRenderTimer: number | undefined;
   let resetDelete: () => void = () => {};
   let clearResult: () => void = () => {};
   const fieldHandles = new Map<keyof Character, Handle>();
@@ -3295,6 +3585,7 @@ function buildCharacterForge(parent: HTMLElement): void {
       charState.result = "";
       clearResult();
       characterCache.delete(removedId);
+      retainedCharacterIds.delete(removedId);
       markCharactersChanged();
       void host.storage.delete(characterKey(removedId)).catch(() => {});
       resetDelete();
@@ -3355,7 +3646,9 @@ function buildCharacterForge(parent: HTMLElement): void {
         clearResult();
         markCharactersChanged();
         if (field.key === "name") {
-          window.setTimeout(() => {
+          if (nameRenderTimer !== undefined) window.clearTimeout(nameRenderTimer);
+          nameRenderTimer = window.setTimeout(() => {
+            nameRenderTimer = undefined;
             renderSelect();
             refreshAll();
           }, 500);
@@ -3367,6 +3660,7 @@ function buildCharacterForge(parent: HTMLElement): void {
   }
 
   const { node: resultHost, set: setResult } = addResult(parent);
+  setResult(charState.result);
   clearResult = () => {
     setResult("");
     powerResults["character"] = false;
@@ -3638,6 +3932,7 @@ function buildProse(parent: HTMLElement): void {
   });
 
   const { node: resultHost, set: setResult } = addResult(parent);
+  setResult(proseState.result);
   resultClearers["prose"] = () => setResult("");
   const resultActions = addActions(parent);
   addButton(resultActions, "Send to agent", "secondary", () => {
@@ -3684,43 +3979,70 @@ let sparksSaving = false;
 let sparksSavePending = false;
 let sparksTouched = false;
 let sparksVersion = 0;
+let sparksLoaded = false;
+let sparksSaveWarned = false;
+let sparksSaveChain: Promise<void> = Promise.resolve();
+const retainedSparkIds = new Set<string>();
 
-function saveSparksNow(): void {
-  if (sparksSaving) {
-    sparksSavePending = true;
-    return;
+function sparkIndexIds(snapshot: Spark[]): string[] {
+  const ids = snapshot.map((spark) => spark.id);
+  for (const id of retainedSparkIds) {
+    if (!ids.includes(id) && ids.length < 60) ids.push(id);
   }
-  sparksSaving = true;
-  const version = sparksVersion;
-  const snapshot = sparks.slice(0, 60).map((spark) => ({ ...spark }));
-  void (async () => {
+  return ids.slice(0, 60);
+}
+
+async function runSparksSave(): Promise<void> {
+  do {
+    sparksSavePending = false;
+    const version = sparksVersion;
+    const snapshot = sparks.slice(0, 60).map((spark) => ({ ...spark }));
     let ok = false;
     const nextCache = new Map<string, string>();
     const writes: Array<Promise<unknown>> = [];
     for (const spark of snapshot) {
       const serialized = JSON.stringify(spark);
       nextCache.set(spark.id, serialized);
+      retainedSparkIds.delete(spark.id);
       if (sparkCache.get(spark.id) !== serialized) {
-        writes.push(host.storage.set(sparkKey(spark.id), spark));
+        /* Storage validates JSON strictly: undefined properties are rejected. */
+        writes.push(host.storage.set(sparkKey(spark.id), JSON.parse(serialized)));
       }
     }
     try {
       await Promise.all(writes);
-      await host.storage.set(SPARK_INDEX_KEY, snapshot.map((spark) => spark.id));
+      await host.storage.set(SPARK_INDEX_KEY, sparkIndexIds(snapshot));
       sparkCache.clear();
       for (const [id, serialized] of nextCache) sparkCache.set(id, serialized);
       ok = true;
     } catch {
       toast("error", "Could not save ideas.");
-    } finally {
-      sparksSaving = false;
-      if (ok && sparksVersion === version) sparksTouched = false;
-      if (sparksSavePending) {
-        sparksSavePending = false;
-        persistSparks();
-      }
     }
-  })();
+    if (!ok) return;
+    if (sparksVersion === version && !sparksSavePending) {
+      sparksTouched = false;
+      return;
+    }
+  } while (sparksLoaded);
+}
+
+function saveSparksNow(): Promise<void> {
+  if (!sparksLoaded) {
+    if (!sparksSaveWarned) {
+      sparksSaveWarned = true;
+      toast("error", "Saved ideas could not be read, so Fox Box will not overwrite them. Reopen the panel.");
+    }
+    return sparksSaveChain;
+  }
+  if (sparksSaving) {
+    sparksSavePending = true;
+    return sparksSaveChain;
+  }
+  sparksSaving = true;
+  sparksSaveChain = runSparksSave().finally(() => {
+    sparksSaving = false;
+  });
+  return sparksSaveChain;
 }
 
 const persistSparks = debounce(saveSparksNow, 450);
@@ -4012,6 +4334,7 @@ function buildIdeaDistiller(parent: HTMLElement): void {
     markSparksChanged();
     for (const id of removedIds) {
       sparkCache.delete(id);
+      retainedSparkIds.delete(id);
       void host.storage.delete(sparkKey(id)).catch(() => {});
     }
     resetRemove();
@@ -4027,6 +4350,7 @@ function buildIdeaDistiller(parent: HTMLElement): void {
   };
 
   const { node: resultHost, set: setResult } = addResult(parent);
+  setResult(ideaState.result);
   resultClearers["idea"] = () => setResult("");
   const resultActions = addActions(parent);
   addButton(resultActions, "Send to Slice Forge", "secondary", () => {
@@ -4437,18 +4761,41 @@ function metricsReport(): string {
     const lastOld = latestRequestNumber("lastOld", "oldChars");
     const lastFresh = latestRequestNumber("lastFresh", "freshChars");
     const lastOther = latestRequestNumber("lastOther", "otherChars");
+    const lastSuperseded = latestRequestNumber("lastSupersededChars", "supersededChars");
+    const lastStale = latestRequestNumber("lastStaleChars", "staleChars");
+    const lastCompacted = latestRequestNumber("lastCompactedChars", "compactedChars");
+    const lastReceipts = latestRequestNumber("lastReceiptChars", "receiptChars");
+    const lastBudget = latestRequestNumber("lastBudgetChars", "budgetChars");
     const lastTrimmedResults = latestRequestNumber("lastTrimmedResults", "trimmedResults");
     const lastToolResults = latestRequestNumber("lastToolResults", "toolResults");
+    const last = pluginStatus?.last;
+    const measure =
+      (entry && entry.lastMeasure) || (last && last.sessionId === sessionId() ? last.measure : undefined);
     lines.push(
       `Requests guarded: ${fmt(runs)}`,
       `Latest request: ${fmt(lastSaved)} of ${fmt(lastTotal)} chars pruned (≈${fmt(tokensForChars(lastSaved, estimate))} tokens; ${tokenBasisText(estimate)})`,
       `Latest savings rate: ${lastTotal > 0 ? fmtPercent(lastRate) : "unknown"} of that request`,
-      `Latest breakdown: aged ${fmt(lastOld)}, fresh ${fmt(lastFresh)}, repeats ${fmt(lastCollapsedChars)} (${fmt(lastCollapsed)} calls), other ${fmt(lastOther)} chars`,
+      `Latest breakdown: aged ${fmt(lastOld)}, fresh ${fmt(lastFresh)}, repeats ${fmt(lastCollapsedChars)} (${fmt(lastCollapsed)} calls), superseded ${fmt(lastSuperseded)}, stale ${fmt(lastStale)}, compactors ${fmt(lastCompacted)}, receipts ${fmt(lastReceipts)}, budget ${fmt(lastBudget)}, other ${fmt(lastOther)} chars`,
       `Tool results: ${fmt(lastTrimmedResults)} of ${fmt(lastToolResults)} shortened by size in the latest request`,
       `Across all guarded requests: ${fmt(totalSaved)} chars pruned (≈${fmt(tokensForChars(totalSaved, estimate))} tokens)`,
       `Average per guarded request: ${totalOriginal > 0 ? fmtPercent(percentOf(totalSaved, totalOriginal)) : "unknown"} of the text`,
       `Note: the same context is re-sent every turn, so the across-requests total is cumulative input saved, not unique characters.`,
     );
+    if (measure) {
+      lines.push(
+        `Whole request: ${fmt(amount(measure.chars))} chars ≈ ${fmt(amount(measure.estimatedTokens))} tokens; system ${fmt(amount(measure.system))}, tool definitions ${fmt(amount(measure.toolDefinitions))}, text ${fmt(amount(measure.text))}, reasoning ${fmt(amount(measure.reasoning))}, media ${fmt(amount(measure.media))}, tool results ${fmt(amount(measure.toolResults))}, tool inputs ${fmt(amount(measure.toolInputs))}`,
+      );
+    }
+    if (last && last.sessionId === sessionId()) {
+      const budgetOver = amount(last.budgetOver);
+      const pruneErrors = amount(last.pruneErrors);
+      if (budgetOver > 0) {
+        lines.push(`Budget: still over by ${fmt(budgetOver)} chars after eviction (only protected or non-removable content remained).`);
+      }
+      if (pruneErrors > 0) {
+        lines.push(`Pruning stages that failed on the latest request: ${fmt(pruneErrors)}.`);
+      }
+    }
   } else {
     lines.push("Requests guarded: none in this chat yet");
   }
@@ -4545,7 +4892,7 @@ function buildMetrics(parent: HTMLElement): void {
     el(
       "div",
       "fb-note",
-      "Pruning is measured exactly, in characters, by counting the outgoing message text, tool results, and tool arguments before and after Fox Box edits the request. Headline numbers describe the latest guarded request. A chat re-sends its history every turn, so the same text can be pruned again on the next request; the across-requests total sums those per-request savings and represents input saved over time, not unique characters removed. Tokens are estimated from the latest request's measured context tokens divided by the characters Fox Box kept for it, which gives this model's average tokens per character; when OpenChamber's context meter has no measurement yet, Fox Box falls back to four characters per token. The meter counts the whole request, including the system prompt and tool definitions, so a very small context can read slightly high. Totals begin when OpenCode starts and reset on restart.",
+      "Pruning is measured exactly, in characters, by counting the outgoing message text, tool results, and tool arguments before and after Fox Box edits the request. The whole-request line adds the system prompt, tool definitions, reasoning, media bytes, and tool inputs, so you can see which part dominates. Headline numbers describe the latest guarded request. A chat re-sends its history every turn, so the same text can be pruned again on the next request; the across-requests total sums those per-request savings and represents input saved over time, not unique characters removed. Tokens are estimated from the latest request's measured context tokens divided by the characters Fox Box kept for it, which gives this model's average tokens per character; when OpenChamber's context meter has no measurement yet, Fox Box falls back to four characters per token. The meter counts the whole request, including the system prompt and tool definitions, so a very small context can read slightly high. Totals begin when OpenCode starts and reset on restart.",
     ),
   );
   parent.append(details);
@@ -4620,14 +4967,24 @@ function buildMetrics(parent: HTMLElement): void {
       const oldChars = latestRequestNumber("lastOld", "oldChars");
       const freshChars = latestRequestNumber("lastFresh", "freshChars");
       const latestCollapsedChars = latestRequestNumber("lastCollapsedChars", "collapsedChars");
-      const other =
-        latestRequestNumber("lastOther", "otherChars") ||
-        Math.max(0, lastSaved - oldChars - freshChars - latestCollapsedChars);
-      const total = Math.max(lastSaved, oldChars + freshChars + latestCollapsedChars + other);
+      const supersededChars = latestRequestNumber("lastSupersededChars", "supersededChars");
+      const staleChars = latestRequestNumber("lastStaleChars", "staleChars");
+      const compactedChars = latestRequestNumber("lastCompactedChars", "compactedChars");
+      const receiptChars = latestRequestNumber("lastReceiptChars", "receiptChars");
+      const budgetChars = latestRequestNumber("lastBudgetChars", "budgetChars");
+      const categorized =
+        oldChars + freshChars + latestCollapsedChars + supersededChars + staleChars + compactedChars + receiptChars + budgetChars;
+      const other = latestRequestNumber("lastOther", "otherChars") || Math.max(0, lastSaved - categorized);
+      const total = Math.max(lastSaved, categorized + other);
       breakdown.append(
         breakdownRow("Aged results", oldChars, total),
         breakdownRow("Fresh / kept reads", freshChars, total),
         breakdownRow("Duplicate calls", latestCollapsedChars, total),
+        breakdownRow("Superseded reads", supersededChars, total),
+        breakdownRow("Stale reads", staleChars, total),
+        breakdownRow("Type compactors", compactedChars, total),
+        breakdownRow("Edit receipts", receiptChars, total),
+        breakdownRow("Budget eviction", budgetChars, total),
       );
       if (other > 0) breakdown.append(breakdownRow("Other", other, total));
       breakdown.append(breakdownRow("Total", total, total, true));
@@ -4641,6 +4998,46 @@ function buildMetrics(parent: HTMLElement): void {
             `Trimmed ${trimmedResults} of ${toolResults} tool result${toolResults === 1 ? "" : "s"} by size in the latest request; repeats are counted separately.`,
           ),
         );
+      }
+      const last = pluginStatus?.last;
+      const measure =
+        (entry && entry.lastMeasure) || (last && last.sessionId === sessionId() ? last.measure : undefined);
+      if (measure) {
+        breakdown.append(
+          el(
+            "div",
+            "fb-note",
+            `Whole request: ${fmt(amount(measure.chars))} chars ≈ ${fmtCompact(
+              amount(measure.estimatedTokens),
+            )} tokens. System ${fmt(amount(measure.system))} · tool definitions ${fmt(
+              amount(measure.toolDefinitions),
+            )} · text ${fmt(amount(measure.text))} · reasoning ${fmt(amount(measure.reasoning))} · media ${fmt(
+              amount(measure.media),
+            )} · tool results ${fmt(amount(measure.toolResults))} · tool inputs ${fmt(amount(measure.toolInputs))}.`,
+          ),
+        );
+      }
+      if (last && last.sessionId === sessionId()) {
+        const budgetOver = amount(last.budgetOver);
+        const pruneErrors = amount(last.pruneErrors);
+        if (budgetOver > 0) {
+          breakdown.append(
+            el(
+              "div",
+              "fb-note",
+              `Budget still exceeded by ${fmt(budgetOver)} chars after eviction: only protected or non-removable content remained.`,
+            ),
+          );
+        }
+        if (pruneErrors > 0) {
+          breakdown.append(
+            el(
+              "div",
+              "fb-note",
+              `${fmt(pruneErrors)} pruning stage${pruneErrors === 1 ? "" : "s"} failed on the latest request.`,
+            ),
+          );
+        }
       }
     } else if (entry && runs > 0) {
       breakdown.append(el("div", "fb-empty", "No latest-request breakdown yet."));
@@ -5231,6 +5628,10 @@ function handleItemUnsafe(item: any): void {
 
 function stopSessions(): void {
   sessionsToken += 1;
+  if (sessionsRetryTimer !== undefined) {
+    window.clearTimeout(sessionsRetryTimer);
+    sessionsRetryTimer = undefined;
+  }
   try {
     sessionsStop?.();
   } catch {
@@ -5261,18 +5662,49 @@ async function subscribeSessions(): Promise<void> {
       return;
     }
     sessionsStop = stop;
-  } catch {
+  } catch (error) {
     if (token === sessionsToken) currentSessionRecord = null;
+    /* A transient refusal must not leave the session strip dead for the rest of the panel's life. */
+    const code = errorCode(error);
+    if (token === sessionsToken && id === projectId && code !== "NOT_GRANTED" && code !== "UNSUPPORTED") {
+      if (sessionsRetryTimer !== undefined) window.clearTimeout(sessionsRetryTimer);
+      sessionsRetryTimer = window.setTimeout(() => {
+        sessionsRetryTimer = undefined;
+        if (token === sessionsToken && id === projectId) void subscribeSessions();
+      }, 5000);
+    }
   }
+}
+
+function clearProjectRetry(): void {
+  if (projectRetryTimer !== undefined) {
+    window.clearTimeout(projectRetryTimer);
+    projectRetryTimer = undefined;
+  }
+}
+
+function scheduleProjectRetry(): void {
+  if (projectRetryTimer !== undefined || !ready?.directory) return;
+  const delay = projectRetryDelay;
+  projectRetryDelay = Math.min(60_000, projectRetryDelay * 2);
+  projectRetryTimer = window.setTimeout(() => {
+    projectRetryTimer = undefined;
+    if (!ready?.directory) return;
+    void syncProject().catch(() => {
+      // syncProject schedules its own retry.
+    });
+  }, delay);
 }
 
 async function syncProject(): Promise<void> {
   const seq = ++syncSeq;
+  clearProjectRetry();
   const directory = ready?.directory;
   const nextStatusKey = statusFileKey(directory);
   if (nextStatusKey !== statusKey) {
     statusKey = nextStatusKey;
     pluginStatus = null;
+    stopSessions();
   }
   /* Match the plugin's key exactly. It normalizes ctx.location.directory and keeps "" when
      there is none; an arbitrary "global" key here would save a brief the plugin never reads. */
@@ -5282,11 +5714,14 @@ async function syncProject(): Promise<void> {
   handles["context-brief"]?.update({ value: currentBrief(), disabled: true });
   if (!directory) {
     projectId = null;
+    projectRetryDelay = 5000;
     handles["context-brief"]?.update({ value: currentBrief(), disabled: false });
     stopSessions();
     refreshAll();
     return;
   }
+  let resolved = false;
+  let retryable = true;
   try {
     const projects = await host.listProjects();
     if (seq !== syncSeq) return;
@@ -5295,14 +5730,27 @@ async function syncProject(): Promise<void> {
     );
     projectId = match?.id ?? null;
     projectKey = normalizeDir(match?.directory) || fallbackKey;
-  } catch {
+    resolved = Boolean(projectId);
+  } catch (error) {
     if (seq !== syncSeq) return;
     projectId = null;
+    const code = errorCode(error);
+    retryable = code !== "NOT_GRANTED" && code !== "UNSUPPORTED";
   }
   if (seq !== syncSeq) return;
   handles["context-brief"]?.update({ value: currentBrief(), disabled: false });
-  await subscribeSessions();
-  if (seq !== syncSeq) return;
+  if (!resolved) {
+    /* The project list or the match can be temporarily unavailable while OpenChamber starts. */
+    if (retryable) scheduleProjectRetry();
+  } else {
+    projectRetryDelay = 5000;
+    if (sessionsRetryTimer !== undefined) {
+      window.clearTimeout(sessionsRetryTimer);
+      sessionsRetryTimer = undefined;
+    }
+    await subscribeSessions();
+    if (seq !== syncSeq) return;
+  }
   refreshAll();
 }
 
@@ -5322,7 +5770,12 @@ async function refreshPluginStatus(): Promise<boolean> {
   }
   try {
     let content: string | null = null;
-    for (const path of [projectStatusPath(), LEGACY_STATUS_PATH]) {
+    /*
+     * The legacy file is global and carries no project identity. Only consult it
+     * when no project is open, or its numbers would be shown as this project's.
+     */
+    const statusPaths = ready?.directory ? [projectStatusPath()] : [projectStatusPath(), LEGACY_STATUS_PATH];
+    for (const path of statusPaths) {
       try {
         const result = await host.readFile(path);
         content = result.content;
@@ -5393,26 +5846,34 @@ function normalizeCharacter(value: Character): Character {
 
 function normalizeSpark(value: Spark): Spark {
   const scores = value.scores;
-  return {
+  const spark: Spark = {
     id: value.id,
     title: String(value.title ?? "").slice(0, 160),
     note: String(value.note ?? "").slice(0, NOTE_MAX),
     createdAt: Number(value.createdAt) || Date.now(),
-    scores:
-      scores && typeof scores === "object"
-        ? {
-            novelty: clampInt(scores.novelty, 1, 5, 3),
-            usefulness: clampInt(scores.usefulness, 1, 5, 3),
-            fit: clampInt(scores.fit, 1, 5, 3),
-            effort: clampInt(scores.effort, 1, 5, 3),
-          }
-        : undefined,
   };
+  if (scores && typeof scores === "object") {
+    spark.scores = {
+      novelty: clampInt(scores.novelty, 1, 5, 3),
+      usefulness: clampInt(scores.usefulness, 1, 5, 3),
+      fit: clampInt(scores.fit, 1, 5, 3),
+      effort: clampInt(scores.effort, 1, 5, 3),
+    };
+  }
+  return spark;
 }
 
 async function loadStorage(): Promise<void> {
   characters = [];
   sparks = [];
+  characterCache.clear();
+  sparkCache.clear();
+  retainedCharacterIds.clear();
+  retainedSparkIds.clear();
+  charactersLoaded = false;
+  sparksLoaded = false;
+  charactersSaveWarned = false;
+  sparksSaveWarned = false;
   let legacyCharacters = false;
   let legacySparks = false;
   try {
@@ -5423,18 +5884,31 @@ async function loadStorage(): Promise<void> {
         ids.map((id) => host.storage.get(characterKey(id)).catch(() => undefined)),
       );
       characters = loaded.filter(isCharacter).map(normalizeCharacter).slice(0, 40);
+      /* A record that failed to load stays referenced so the next save cannot orphan it. */
+      for (let position = 0; position < ids.length; position += 1) {
+        if (!isCharacter(loaded[position])) retainedCharacterIds.add(ids[position]!);
+      }
       selectedCharacterId = characters[0]?.id ?? null;
+      charactersLoaded = true;
     } else {
       const legacy = await host.storage.get("characters");
       if (Array.isArray(legacy)) {
         legacyCharacters = true;
         characters = legacy.filter(isCharacter).map(normalizeCharacter).slice(0, 40);
         selectedCharacterId = characters[0]?.id ?? null;
-        if (characters.length) persistCharacters();
+        charactersLoaded = true;
+        if (characters.length) {
+          charactersTouched = true;
+          persistCharacters();
+        }
+      } else if (legacy === undefined) {
+        /* No saved data at all: an empty store is safe to write. */
+        charactersLoaded = true;
       }
     }
   } catch {
-    characters = [];
+    /* Keep save blocked: an unreadable index must never be replaced by an empty one. */
+    charactersLoaded = false;
   }
   try {
     const index = await host.storage.get(SPARK_INDEX_KEY);
@@ -5444,16 +5918,26 @@ async function loadStorage(): Promise<void> {
         ids.map((id) => host.storage.get(sparkKey(id)).catch(() => undefined)),
       );
       sparks = loaded.filter(isSpark).map(normalizeSpark).slice(0, 60);
+      for (let position = 0; position < ids.length; position += 1) {
+        if (!isSpark(loaded[position])) retainedSparkIds.add(ids[position]!);
+      }
+      sparksLoaded = true;
     } else {
       const legacy = await host.storage.get("sparks");
       if (Array.isArray(legacy)) {
         legacySparks = true;
         sparks = legacy.filter(isSpark).map(normalizeSpark).slice(0, 60);
-        if (sparks.length) persistSparks();
+        sparksLoaded = true;
+        if (sparks.length) {
+          sparksTouched = true;
+          persistSparks();
+        }
+      } else if (legacy === undefined) {
+        sparksLoaded = true;
       }
     }
   } catch {
-    sparks = [];
+    sparksLoaded = false;
   }
   if (!legacyCharacters) {
     characterCache.clear();
@@ -5486,6 +5970,12 @@ async function boot(ctx: any): Promise<void> {
         "Fox Box could not load its config file, so changes stay in memory only. Fix or remove ~/.config/openchamber/fox-box/config.json, or approve Fox Box's file access, then reopen the panel.",
       );
       configSaveWarned = true;
+    } else if (!charactersLoaded || !sparksLoaded) {
+      showBanner(
+        "warning",
+        "Saved data could not be read",
+        "Fox Box will not overwrite saved characters or ideas. Reopen the panel to try loading them again.",
+      );
     }
     booted = true;
     booting = false;
@@ -5581,26 +6071,34 @@ host.onItem((item: any) => {
 
 window.addEventListener("pagehide", () => {
   stopSessions();
+  clearProjectRetry();
   if (statusTimer !== undefined) {
     window.clearInterval(statusTimer);
     statusTimer = undefined;
   }
+  const hadConfigTimer = configTimer !== undefined;
   if (configTimer !== undefined) {
     window.clearTimeout(configTimer);
     configTimer = undefined;
-    /* Send the pending write before dispose; the host processes messages in order. */
-    void saveConfigNow();
   }
-  if (charactersTouched) saveCharactersNow();
-  if (sparksTouched) saveSparksNow();
-  try {
-    bannerHandle?.dispose();
-  } catch {
-    // The frame is going away.
-  }
-  try {
-    host.dispose();
-  } catch {
-    // The frame is going away; a dispose error is not actionable.
-  }
+  /*
+   * Wait for the writes that were already in flight instead of only starting new
+   * ones: a save that is running re-reads the current state before it exits.
+   */
+  const writes: Array<Promise<void>> = [];
+  if (hadConfigTimer || configPending || savingConfig) writes.push(saveConfigNow());
+  if (charactersTouched || charactersSaving) writes.push(saveCharactersNow());
+  if (sparksTouched || sparksSaving) writes.push(saveSparksNow());
+  void Promise.allSettled(writes).finally(() => {
+    try {
+      bannerHandle?.dispose();
+    } catch {
+      // The frame is going away.
+    }
+    try {
+      host.dispose();
+    } catch {
+      // The frame is going away; a dispose error is not actionable.
+    }
+  });
 });

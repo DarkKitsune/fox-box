@@ -52,7 +52,8 @@ if (!fs.existsSync(path.join(root, "panel", "main.js"))) {
   if (fs.existsSync(sourcePath)) {
     try {
       if (fs.statSync(sourcePath).mtimeMs > fs.statSync(builtPath).mtimeMs) {
-        console.warn("panel/main.js is older than panel/main.ts; run `npm run build` before installing.");
+        console.error("panel/main.js is older than panel/main.ts; run `npm run build` before installing.");
+        process.exitCode = 1;
       }
     } catch {
       // A stat failure is not a manifest problem.

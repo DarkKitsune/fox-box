@@ -2796,7 +2796,7 @@ ${GUEST_UI_LOOK_CSS}`;
   }
 
   // panel/main.ts
-  var VERSION = "1.1.1";
+  var VERSION = "1.2.0";
   var CONFIG_VERSION = 2;
   var CONFIG_PATH = "~/.config/openchamber/fox-box/config.json";
   var LEGACY_STATUS_PATH = "~/.config/openchamber/fox-box/status.json";
@@ -2895,6 +2895,9 @@ ${GUEST_UI_LOOK_CSS}`;
   var currentSessionRecord = null;
   var sessionsStop = null;
   var sessionsToken = 0;
+  var sessionsRetryTimer;
+  var projectRetryTimer;
+  var projectRetryDelay = 5e3;
   var projectId = null;
   var projectKey = "";
   var lastDirectory = "";
@@ -3191,6 +3194,16 @@ ${text.slice(-tail)}`;
           maxToolOutput: 48e3,
           maxOldToolOutput: 6e3,
           protectPaths: "",
+          pathSupersession: true,
+          staleReads: true,
+          mergeReadRanges: true,
+          editReceipts: true,
+          receiptMinChars: 1200,
+          smartCompaction: true,
+          skeletonCodeReads: true,
+          budgetTokens: 0,
+          charsPerToken: 4,
+          relevanceScoring: true,
           briefs: {}
         },
         model: {
@@ -3261,6 +3274,31 @@ ${text.slice(-tail)}`;
             base.powers.context.maxOldToolOutput
           ),
           protectPaths: typeof context.protectPaths === "string" ? context.protectPaths.slice(0, 4e3) : "",
+          pathSupersession: context.pathSupersession !== false,
+          staleReads: context.staleReads !== false,
+          mergeReadRanges: context.mergeReadRanges !== false,
+          editReceipts: context.editReceipts !== false,
+          receiptMinChars: clampInt(
+            context.receiptMinChars ?? base.powers.context.receiptMinChars,
+            200,
+            2e4,
+            base.powers.context.receiptMinChars
+          ),
+          smartCompaction: context.smartCompaction !== false,
+          skeletonCodeReads: context.skeletonCodeReads !== false,
+          budgetTokens: clampInt(
+            context.budgetTokens ?? base.powers.context.budgetTokens,
+            0,
+            2e6,
+            base.powers.context.budgetTokens
+          ),
+          charsPerToken: clampNumber(
+            context.charsPerToken ?? base.powers.context.charsPerToken,
+            1,
+            20,
+            base.powers.context.charsPerToken
+          ),
+          relevanceScoring: context.relevanceScoring !== false,
           briefs
         },
         model: {
@@ -3308,15 +3346,18 @@ ${text.slice(-tail)}`;
   var configLoaded = false;
   var configNewer = false;
   var configSaveWarned = false;
+  var configPending = false;
+  var configSavePromise = Promise.resolve();
   function queueConfigSave() {
     setFooter("Saving rules\u2026");
+    configPending = true;
     if (configTimer !== void 0) window.clearTimeout(configTimer);
     configTimer = window.setTimeout(() => {
       configTimer = void 0;
       void saveConfigNow();
     }, 320);
   }
-  async function saveConfigNow() {
+  function saveConfigNow() {
     if (!configLoaded || configNewer) {
       setFooter("Rules not saved");
       if (!configSaveWarned) {
@@ -3327,33 +3368,38 @@ ${text.slice(-tail)}`;
           configNewer ? "This config file was written by a newer Fox Box version. Update the extension before saving; changes stay in memory for now." : "Fox Box could not load its config file, so it will not overwrite it. Fix or remove ~/.config/openchamber/fox-box/config.json, or approve Fox Box's file access in Settings \u2192 Extensions, then reopen the panel."
         );
       }
-      return;
+      return configSavePromise;
     }
     if (savingConfig) {
       saveAgain = true;
-      return;
+      return configSavePromise;
     }
     savingConfig = true;
-    try {
-      do {
-        saveAgain = false;
-        const snapshot = JSON.stringify(config, null, 2);
-        try {
-          await host.writeFile(CONFIG_PATH, snapshot);
-          setFooter("Rules saved");
-        } catch (error) {
-          setFooter("Rules not saved");
-          notifyError(error, "Saving rules");
-          if (saveAgain) {
-            saveAgain = false;
-            queueConfigSave();
+    configSavePromise = (async () => {
+      try {
+        do {
+          saveAgain = false;
+          syncMeasuredRatio();
+          const snapshot = JSON.stringify(config, null, 2);
+          try {
+            await host.writeFile(CONFIG_PATH, snapshot);
+            setFooter("Rules saved");
+            if (!saveAgain) configPending = false;
+          } catch (error) {
+            setFooter("Rules not saved");
+            notifyError(error, "Saving rules");
+            if (saveAgain) {
+              saveAgain = false;
+              queueConfigSave();
+            }
+            return;
           }
-          return;
-        }
-      } while (saveAgain);
-    } finally {
-      savingConfig = false;
-    }
+        } while (saveAgain);
+      } finally {
+        savingConfig = false;
+      }
+    })();
+    return configSavePromise;
   }
   async function loadConfig() {
     try {
@@ -3387,9 +3433,7 @@ ${text.slice(-tail)}`;
         }
         return;
       }
-      config = defaultConfig();
       configLoaded = false;
-      configNewer = false;
       setFooter("Local rules only");
       if (errorCode(error) !== "NOT_GRANTED") notifyError(error, "Loading rules");
     }
@@ -3422,7 +3466,7 @@ ${text.slice(-tail)}`;
   function tokenEstimate() {
     const last = pluginStatus?.last;
     const tokens = amount(currentSessionRecord?.context?.tokens);
-    const chars = amount(last?.keptChars);
+    const chars = amount(last?.measure?.textChars) || amount(last?.keptChars);
     if (!config.powers.context.enabled || !last || last.sessionId !== sessionId() || tokens <= 0 || chars <= 0) {
       return { perChar: FALLBACK_TOKENS_PER_CHAR, measured: false };
     }
@@ -3434,6 +3478,11 @@ ${text.slice(-tail)}`;
   }
   function tokensForChars(chars, estimate = tokenEstimate()) {
     return Math.round(Math.max(0, chars) * estimate.perChar);
+  }
+  function syncMeasuredRatio() {
+    const estimate = tokenEstimate();
+    if (!estimate.measured) return;
+    config.powers.context.charsPerToken = clampNumber(1 / estimate.perChar, 1, 20, 4);
   }
   function latestRequestNumber(entryKey, lastKey) {
     const entry = currentPluginSession();
@@ -3952,8 +4001,15 @@ Return JSON only.`,
     );
   }
   async function readOptional(path) {
+    let target = normalizeGuestPath(path);
+    if (path.startsWith("/") || path.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(path)) {
+      const relative = relativeToProject(path);
+      if (!relative) return null;
+      target = normalizeGuestPath(relative);
+    }
+    if (!target || target.split("/").includes("..")) return null;
     try {
-      const { content } = await host.readFile(normalizeGuestPath(path));
+      const { content } = await host.readFile(target);
       return content;
     } catch {
       return null;
@@ -4101,7 +4157,7 @@ Return JSON only.`,
     addSwitch(
       protection,
       "Shield skill files",
-      "The newest read of a SKILL.md, a skill-tool result, or a pinned path stays whole until that exact read is replaced by a newer one.",
+      "The newest copy of SKILL.md, any file in a skills/ or skill/ folder, a skill JSON manifest, a skill-tool result, or a pinned path stays whole. Older copies can be pruned after a re-read.",
       () => config.powers.context.protectSkills,
       (value) => {
         config.powers.context.protectSkills = value;
@@ -4215,6 +4271,95 @@ Return JSON only.`,
         config.powers.context.maxOldToolOutput = Number(value) || 6e3;
       }
     );
+    const advanced = group(parent, "Advanced pruning");
+    addSwitch(
+      advanced,
+      "Supersede older reads",
+      "When a file is read again, the newest read wins. Older reads whose line range is fully covered by newer reads become a short pointer; partial overlaps are merged instead.",
+      () => config.powers.context.pathSupersession,
+      (value) => {
+        config.powers.context.pathSupersession = value;
+      }
+    );
+    addSwitch(
+      advanced,
+      "Mark stale reads",
+      "A read from before a later successful edit is marked stale. A skill or pinned file always keeps one copy, even when it was not re-read after the edit.",
+      () => config.powers.context.staleReads,
+      (value) => {
+        config.powers.context.staleReads = value;
+      }
+    );
+    addSwitch(
+      advanced,
+      "Merge overlapping ranges",
+      "When two reads of the same file share lines, the older copy drops the repeated lines and keeps the rest. Used only when the newer read is recent enough to survive the size caps.",
+      () => config.powers.context.mergeReadRanges,
+      (value) => {
+        config.powers.context.mergeReadRanges = value;
+      }
+    );
+    addSwitch(
+      advanced,
+      "Edit receipts",
+      "Older large write/edit/patch arguments become path, +N/-M, hash, and hunk count. The latest edit for each file stays intact, and the file on disk remains the source of truth.",
+      () => config.powers.context.editReceipts,
+      (value) => {
+        config.powers.context.editReceipts = value;
+      }
+    );
+    addSwitch(
+      advanced,
+      "Type-aware compactors",
+      "Old test logs, stack traces, diffs, grep/glob lists, JSON/CSV, and web pages are reduced to their useful shape before the size caps run.",
+      () => config.powers.context.smartCompaction,
+      (value) => {
+        config.powers.context.smartCompaction = value;
+      }
+    );
+    addSwitch(
+      advanced,
+      "Code read skeletons",
+      "Old source reads keep imports, signatures, and top-level declarations while eliding function bodies. Only applied to large reads of known code files.",
+      () => config.powers.context.skeletonCodeReads,
+      (value) => {
+        config.powers.context.skeletonCodeReads = value;
+      }
+    );
+    const advancedGrid = el2("div", "fb-grid2");
+    advanced.append(advancedGrid);
+    addSelect(
+      advancedGrid,
+      "Request budget",
+      [
+        { id: "0", label: "Off", hint: "size caps only" },
+        { id: "8000", label: "8k tokens" },
+        { id: "16000", label: "16k tokens" },
+        { id: "24000", label: "24k tokens" },
+        { id: "32000", label: "32k tokens" },
+        { id: "48000", label: "48k tokens" },
+        { id: "64000", label: "64k tokens" },
+        { id: "96000", label: "96k tokens" },
+        { id: "128000", label: "128k tokens" }
+      ],
+      () => String(config.powers.context.budgetTokens),
+      (value) => {
+        config.powers.context.budgetTokens = Number(value) || 0;
+      }
+    );
+    addSwitch(
+      advancedGrid,
+      "Protect relevant context",
+      "When a budget is set, keep files and symbols named in the latest user message and recent turns longer than unrelated old output.",
+      () => config.powers.context.relevanceScoring,
+      (value) => {
+        config.powers.context.relevanceScoring = value;
+      }
+    );
+    addNote(
+      advanced,
+      "Skill protection always covers SKILL.md, every file inside a skills/ or skill/ folder, and skill JSON manifests. Older copies may be pruned after a re-read, but at least one copy of a protected skill file stays whole. The budget is estimated with the measured tokens-per-character ratio when the panel can see it, otherwise four characters per token."
+    );
     group(parent, "Focus brief");
     const brief = addText(
       parent,
@@ -4274,6 +4419,14 @@ Return JSON only.`,
         `Trim tool output: ${config.powers.context.trimToolOutput ? "on" : "off"}`,
         `Fresh tool cap: ${fmt(config.powers.context.maxToolOutput)} chars`,
         `Old tool budget: ${fmt(config.powers.context.maxOldToolOutput)} chars`,
+        `Supersede older reads: ${config.powers.context.pathSupersession ? "on" : "off"}`,
+        `Merge read overlaps: ${config.powers.context.mergeReadRanges ? "on" : "off"}`,
+        `Stale reads: ${config.powers.context.staleReads ? "on" : "off"}`,
+        `Edit receipts: ${config.powers.context.editReceipts ? "on" : "off"}`,
+        `Type-aware compactors: ${config.powers.context.smartCompaction ? "on" : "off"}`,
+        `Code read skeletons: ${config.powers.context.skeletonCodeReads ? "on" : "off"}`,
+        `Request budget: ${config.powers.context.budgetTokens > 0 ? `${fmt(config.powers.context.budgetTokens)} tokens` : "off"}`,
+        `Relevance protection: ${config.powers.context.relevanceScoring ? "on" : "off"}`,
         `Pinned paths: ${config.powers.context.protectPaths.trim() || "none"}`,
         `Focus brief: ${currentBrief().trim() || "empty"}`
       ];
@@ -4402,6 +4555,7 @@ ${capText(notesText, 4e3)}
       });
     });
     const { node: resultHost, set: setResult } = addResult(parent);
+    setResult(handoffState.result);
     resultClearers["handoff"] = () => setResult("");
     const resultActions = addActions(parent);
     addButton(resultActions, "Start fresh chat", "secondary", () => {
@@ -4714,6 +4868,7 @@ ${stack}` : ""
       "Forge slice uses the Small Model and waits for one complete answer. Forge in chat hands the same brief to the chat agent, which streams, can read the repo, and is not bound by the panel's one-shot generation call. Fill blanks is a separate Small Model call: it only writes empty goal or constraint fields and is never run by Forge in chat or Send to agent."
     );
     const { node: resultHost, set: setResult } = addResult(parent);
+    setResult(sliceState.result);
     resultClearers["slice"] = () => setResult("");
     const resultActions = addActions(parent);
     addButton(resultActions, "Send to agent", "secondary", () => {
@@ -4890,6 +5045,7 @@ ${bugState.symptom}`,
       });
     });
     const { node: resultHost, set: setResult } = addResult(parent);
+    setResult(bugState.result);
     resultClearers["bug"] = () => setResult("");
     const resultActions = addActions(parent);
     addButton(resultActions, "Send to agent", "secondary", () => {
@@ -5062,6 +5218,7 @@ ${redState.code}
       });
     });
     const { node: resultHost, set: setResult } = addResult(parent);
+    setResult(redState.result);
     resultClearers["red-pen"] = () => setResult("");
     const resultActions = addActions(parent);
     addButton(resultActions, "Send findings", "secondary", () => {
@@ -5312,6 +5469,7 @@ ${sections.join("\n")}`
     });
     addNote(parent, "Fill blanks asks the Small Model for only the empty design fields. It is separate from the Send to agent action below.");
     const { node: resultHost, set: setResult } = addResult(parent);
+    setResult(gameState.result);
     resultClearers["game"] = () => setResult("");
     const resultActions = addActions(parent);
     addButton(resultActions, "Send to agent", "secondary", () => {
@@ -5358,7 +5516,10 @@ ${gameState.result}`,
     const existing = selectedCharacter();
     if (existing) return existing;
     const created = characters[0] ?? blankCharacter();
-    if (!characters.length) characters.push(created);
+    if (!characters.length) {
+      characters.push(created);
+      markCharactersChanged();
+    }
     selectedCharacterId = created.id;
     return created;
   }
@@ -5366,42 +5527,66 @@ ${gameState.result}`,
   var charactersSavePending = false;
   var charactersTouched = false;
   var charactersVersion = 0;
-  function saveCharactersNow() {
-    if (charactersSaving) {
-      charactersSavePending = true;
-      return;
+  var charactersLoaded = false;
+  var charactersSaveWarned = false;
+  var charactersSaveChain = Promise.resolve();
+  var retainedCharacterIds = /* @__PURE__ */ new Set();
+  function characterIndexIds(snapshot) {
+    const ids = snapshot.map((character) => character.id);
+    for (const id of retainedCharacterIds) {
+      if (!ids.includes(id) && ids.length < 40) ids.push(id);
     }
-    charactersSaving = true;
-    const version = charactersVersion;
-    const snapshot = characters.slice(0, 40).map((character) => ({ ...character }));
-    void (async () => {
+    return ids.slice(0, 40);
+  }
+  async function runCharactersSave() {
+    do {
+      charactersSavePending = false;
+      const version = charactersVersion;
+      const snapshot = characters.slice(0, 40).map((character) => ({ ...character }));
       let ok = false;
       const nextCache = /* @__PURE__ */ new Map();
       const writes = [];
       for (const character of snapshot) {
         const serialized = JSON.stringify(character);
         nextCache.set(character.id, serialized);
+        retainedCharacterIds.delete(character.id);
         if (characterCache.get(character.id) !== serialized) {
-          writes.push(host.storage.set(characterKey(character.id), character));
+          writes.push(host.storage.set(characterKey(character.id), JSON.parse(serialized)));
         }
       }
       try {
         await Promise.all(writes);
-        await host.storage.set(CHARACTER_INDEX_KEY, snapshot.map((character) => character.id));
+        await host.storage.set(CHARACTER_INDEX_KEY, characterIndexIds(snapshot));
         characterCache.clear();
         for (const [id, serialized] of nextCache) characterCache.set(id, serialized);
         ok = true;
       } catch {
         toast("error", "Could not save characters.");
-      } finally {
-        charactersSaving = false;
-        if (ok && charactersVersion === version) charactersTouched = false;
-        if (charactersSavePending) {
-          charactersSavePending = false;
-          persistCharacters();
-        }
       }
-    })();
+      if (!ok) return;
+      if (charactersVersion === version && !charactersSavePending) {
+        charactersTouched = false;
+        return;
+      }
+    } while (charactersLoaded);
+  }
+  function saveCharactersNow() {
+    if (!charactersLoaded) {
+      if (!charactersSaveWarned) {
+        charactersSaveWarned = true;
+        toast("error", "Saved characters could not be read, so Fox Box will not overwrite them. Reopen the panel.");
+      }
+      return charactersSaveChain;
+    }
+    if (charactersSaving) {
+      charactersSavePending = true;
+      return charactersSaveChain;
+    }
+    charactersSaving = true;
+    charactersSaveChain = runCharactersSave().finally(() => {
+      charactersSaving = false;
+    });
+    return charactersSaveChain;
   }
   var persistCharacters = debounce(saveCharactersNow, 450);
   function markCharactersChanged() {
@@ -5439,6 +5624,7 @@ ${gameState.result}`,
     const selectHost = el2("div", "fb-actions-grow");
     top.append(selectHost);
     let selectHandle = null;
+    let nameRenderTimer;
     let resetDelete = () => {
     };
     let clearResult = () => {
@@ -5521,6 +5707,7 @@ ${gameState.result}`,
         charState.result = "";
         clearResult();
         characterCache.delete(removedId);
+        retainedCharacterIds.delete(removedId);
         markCharactersChanged();
         void host.storage.delete(characterKey(removedId)).catch(() => {
         });
@@ -5578,7 +5765,9 @@ ${gameState.result}`,
           clearResult();
           markCharactersChanged();
           if (field2.key === "name") {
-            window.setTimeout(() => {
+            if (nameRenderTimer !== void 0) window.clearTimeout(nameRenderTimer);
+            nameRenderTimer = window.setTimeout(() => {
+              nameRenderTimer = void 0;
               renderSelect();
               refreshAll();
             }, 500);
@@ -5589,6 +5778,7 @@ ${gameState.result}`,
       fieldHandles.set(field2.key, handle);
     }
     const { node: resultHost, set: setResult } = addResult(parent);
+    setResult(charState.result);
     clearResult = () => {
       setResult("");
       powerResults["character"] = false;
@@ -5844,6 +6034,7 @@ ${proseState.text}`
       });
     });
     const { node: resultHost, set: setResult } = addResult(parent);
+    setResult(proseState.result);
     resultClearers["prose"] = () => setResult("");
     const resultActions = addActions(parent);
     addButton(resultActions, "Send to agent", "secondary", () => {
@@ -5886,42 +6077,66 @@ ${proseState.result}`,
   var sparksSavePending = false;
   var sparksTouched = false;
   var sparksVersion = 0;
-  function saveSparksNow() {
-    if (sparksSaving) {
-      sparksSavePending = true;
-      return;
+  var sparksLoaded = false;
+  var sparksSaveWarned = false;
+  var sparksSaveChain = Promise.resolve();
+  var retainedSparkIds = /* @__PURE__ */ new Set();
+  function sparkIndexIds(snapshot) {
+    const ids = snapshot.map((spark) => spark.id);
+    for (const id of retainedSparkIds) {
+      if (!ids.includes(id) && ids.length < 60) ids.push(id);
     }
-    sparksSaving = true;
-    const version = sparksVersion;
-    const snapshot = sparks.slice(0, 60).map((spark) => ({ ...spark }));
-    void (async () => {
+    return ids.slice(0, 60);
+  }
+  async function runSparksSave() {
+    do {
+      sparksSavePending = false;
+      const version = sparksVersion;
+      const snapshot = sparks.slice(0, 60).map((spark) => ({ ...spark }));
       let ok = false;
       const nextCache = /* @__PURE__ */ new Map();
       const writes = [];
       for (const spark of snapshot) {
         const serialized = JSON.stringify(spark);
         nextCache.set(spark.id, serialized);
+        retainedSparkIds.delete(spark.id);
         if (sparkCache.get(spark.id) !== serialized) {
-          writes.push(host.storage.set(sparkKey(spark.id), spark));
+          writes.push(host.storage.set(sparkKey(spark.id), JSON.parse(serialized)));
         }
       }
       try {
         await Promise.all(writes);
-        await host.storage.set(SPARK_INDEX_KEY, snapshot.map((spark) => spark.id));
+        await host.storage.set(SPARK_INDEX_KEY, sparkIndexIds(snapshot));
         sparkCache.clear();
         for (const [id, serialized] of nextCache) sparkCache.set(id, serialized);
         ok = true;
       } catch {
         toast("error", "Could not save ideas.");
-      } finally {
-        sparksSaving = false;
-        if (ok && sparksVersion === version) sparksTouched = false;
-        if (sparksSavePending) {
-          sparksSavePending = false;
-          persistSparks();
-        }
       }
-    })();
+      if (!ok) return;
+      if (sparksVersion === version && !sparksSavePending) {
+        sparksTouched = false;
+        return;
+      }
+    } while (sparksLoaded);
+  }
+  function saveSparksNow() {
+    if (!sparksLoaded) {
+      if (!sparksSaveWarned) {
+        sparksSaveWarned = true;
+        toast("error", "Saved ideas could not be read, so Fox Box will not overwrite them. Reopen the panel.");
+      }
+      return sparksSaveChain;
+    }
+    if (sparksSaving) {
+      sparksSavePending = true;
+      return sparksSaveChain;
+    }
+    sparksSaving = true;
+    sparksSaveChain = runSparksSave().finally(() => {
+      sparksSaving = false;
+    });
+    return sparksSaveChain;
   }
   var persistSparks = debounce(saveSparksNow, 450);
   function markSparksChanged() {
@@ -6206,6 +6421,7 @@ Note: ${spark.note}`).join("\n\n---\n\n");
       markSparksChanged();
       for (const id of removedIds) {
         sparkCache.delete(id);
+        retainedSparkIds.delete(id);
         void host.storage.delete(sparkKey(id)).catch(() => {
         });
       }
@@ -6220,6 +6436,7 @@ Note: ${spark.note}`).join("\n\n---\n\n");
       remove?.update({ disabled: selectedSparks.size === 0 });
     };
     const { node: resultHost, set: setResult } = addResult(parent);
+    setResult(ideaState.result);
     resultClearers["idea"] = () => setResult("");
     const resultActions = addActions(parent);
     addButton(resultActions, "Send to Slice Forge", "secondary", () => {
@@ -6588,18 +6805,40 @@ ${ideaState.result}`,
       const lastOld = latestRequestNumber("lastOld", "oldChars");
       const lastFresh = latestRequestNumber("lastFresh", "freshChars");
       const lastOther = latestRequestNumber("lastOther", "otherChars");
+      const lastSuperseded = latestRequestNumber("lastSupersededChars", "supersededChars");
+      const lastStale = latestRequestNumber("lastStaleChars", "staleChars");
+      const lastCompacted = latestRequestNumber("lastCompactedChars", "compactedChars");
+      const lastReceipts = latestRequestNumber("lastReceiptChars", "receiptChars");
+      const lastBudget = latestRequestNumber("lastBudgetChars", "budgetChars");
       const lastTrimmedResults = latestRequestNumber("lastTrimmedResults", "trimmedResults");
       const lastToolResults = latestRequestNumber("lastToolResults", "toolResults");
+      const last = pluginStatus?.last;
+      const measure = entry && entry.lastMeasure || (last && last.sessionId === sessionId() ? last.measure : void 0);
       lines.push(
         `Requests guarded: ${fmt(runs)}`,
         `Latest request: ${fmt(lastSaved)} of ${fmt(lastTotal)} chars pruned (\u2248${fmt(tokensForChars(lastSaved, estimate))} tokens; ${tokenBasisText(estimate)})`,
         `Latest savings rate: ${lastTotal > 0 ? fmtPercent(lastRate) : "unknown"} of that request`,
-        `Latest breakdown: aged ${fmt(lastOld)}, fresh ${fmt(lastFresh)}, repeats ${fmt(lastCollapsedChars)} (${fmt(lastCollapsed)} calls), other ${fmt(lastOther)} chars`,
+        `Latest breakdown: aged ${fmt(lastOld)}, fresh ${fmt(lastFresh)}, repeats ${fmt(lastCollapsedChars)} (${fmt(lastCollapsed)} calls), superseded ${fmt(lastSuperseded)}, stale ${fmt(lastStale)}, compactors ${fmt(lastCompacted)}, receipts ${fmt(lastReceipts)}, budget ${fmt(lastBudget)}, other ${fmt(lastOther)} chars`,
         `Tool results: ${fmt(lastTrimmedResults)} of ${fmt(lastToolResults)} shortened by size in the latest request`,
         `Across all guarded requests: ${fmt(totalSaved)} chars pruned (\u2248${fmt(tokensForChars(totalSaved, estimate))} tokens)`,
         `Average per guarded request: ${totalOriginal > 0 ? fmtPercent(percentOf(totalSaved, totalOriginal)) : "unknown"} of the text`,
         `Note: the same context is re-sent every turn, so the across-requests total is cumulative input saved, not unique characters.`
       );
+      if (measure) {
+        lines.push(
+          `Whole request: ${fmt(amount(measure.chars))} chars \u2248 ${fmt(amount(measure.estimatedTokens))} tokens; system ${fmt(amount(measure.system))}, tool definitions ${fmt(amount(measure.toolDefinitions))}, text ${fmt(amount(measure.text))}, reasoning ${fmt(amount(measure.reasoning))}, media ${fmt(amount(measure.media))}, tool results ${fmt(amount(measure.toolResults))}, tool inputs ${fmt(amount(measure.toolInputs))}`
+        );
+      }
+      if (last && last.sessionId === sessionId()) {
+        const budgetOver = amount(last.budgetOver);
+        const pruneErrors = amount(last.pruneErrors);
+        if (budgetOver > 0) {
+          lines.push(`Budget: still over by ${fmt(budgetOver)} chars after eviction (only protected or non-removable content remained).`);
+        }
+        if (pruneErrors > 0) {
+          lines.push(`Pruning stages that failed on the latest request: ${fmt(pruneErrors)}.`);
+        }
+      }
     } else {
       lines.push("Requests guarded: none in this chat yet");
     }
@@ -6685,7 +6924,7 @@ ${report}`,
       el2(
         "div",
         "fb-note",
-        "Pruning is measured exactly, in characters, by counting the outgoing message text, tool results, and tool arguments before and after Fox Box edits the request. Headline numbers describe the latest guarded request. A chat re-sends its history every turn, so the same text can be pruned again on the next request; the across-requests total sums those per-request savings and represents input saved over time, not unique characters removed. Tokens are estimated from the latest request's measured context tokens divided by the characters Fox Box kept for it, which gives this model's average tokens per character; when OpenChamber's context meter has no measurement yet, Fox Box falls back to four characters per token. The meter counts the whole request, including the system prompt and tool definitions, so a very small context can read slightly high. Totals begin when OpenCode starts and reset on restart."
+        "Pruning is measured exactly, in characters, by counting the outgoing message text, tool results, and tool arguments before and after Fox Box edits the request. The whole-request line adds the system prompt, tool definitions, reasoning, media bytes, and tool inputs, so you can see which part dominates. Headline numbers describe the latest guarded request. A chat re-sends its history every turn, so the same text can be pruned again on the next request; the across-requests total sums those per-request savings and represents input saved over time, not unique characters removed. Tokens are estimated from the latest request's measured context tokens divided by the characters Fox Box kept for it, which gives this model's average tokens per character; when OpenChamber's context meter has no measurement yet, Fox Box falls back to four characters per token. The meter counts the whole request, including the system prompt and tool definitions, so a very small context can read slightly high. Totals begin when OpenCode starts and reset on restart."
       )
     );
     parent.append(details);
@@ -6747,12 +6986,23 @@ ${report}`,
         const oldChars = latestRequestNumber("lastOld", "oldChars");
         const freshChars = latestRequestNumber("lastFresh", "freshChars");
         const latestCollapsedChars = latestRequestNumber("lastCollapsedChars", "collapsedChars");
-        const other = latestRequestNumber("lastOther", "otherChars") || Math.max(0, lastSaved - oldChars - freshChars - latestCollapsedChars);
-        const total = Math.max(lastSaved, oldChars + freshChars + latestCollapsedChars + other);
+        const supersededChars = latestRequestNumber("lastSupersededChars", "supersededChars");
+        const staleChars = latestRequestNumber("lastStaleChars", "staleChars");
+        const compactedChars = latestRequestNumber("lastCompactedChars", "compactedChars");
+        const receiptChars = latestRequestNumber("lastReceiptChars", "receiptChars");
+        const budgetChars = latestRequestNumber("lastBudgetChars", "budgetChars");
+        const categorized = oldChars + freshChars + latestCollapsedChars + supersededChars + staleChars + compactedChars + receiptChars + budgetChars;
+        const other = latestRequestNumber("lastOther", "otherChars") || Math.max(0, lastSaved - categorized);
+        const total = Math.max(lastSaved, categorized + other);
         breakdown.append(
           breakdownRow("Aged results", oldChars, total),
           breakdownRow("Fresh / kept reads", freshChars, total),
-          breakdownRow("Duplicate calls", latestCollapsedChars, total)
+          breakdownRow("Duplicate calls", latestCollapsedChars, total),
+          breakdownRow("Superseded reads", supersededChars, total),
+          breakdownRow("Stale reads", staleChars, total),
+          breakdownRow("Type compactors", compactedChars, total),
+          breakdownRow("Edit receipts", receiptChars, total),
+          breakdownRow("Budget eviction", budgetChars, total)
         );
         if (other > 0) breakdown.append(breakdownRow("Other", other, total));
         breakdown.append(breakdownRow("Total", total, total, true));
@@ -6766,6 +7016,45 @@ ${report}`,
               `Trimmed ${trimmedResults} of ${toolResults} tool result${toolResults === 1 ? "" : "s"} by size in the latest request; repeats are counted separately.`
             )
           );
+        }
+        const last = pluginStatus?.last;
+        const measure = entry && entry.lastMeasure || (last && last.sessionId === sessionId() ? last.measure : void 0);
+        if (measure) {
+          breakdown.append(
+            el2(
+              "div",
+              "fb-note",
+              `Whole request: ${fmt(amount(measure.chars))} chars \u2248 ${fmtCompact(
+                amount(measure.estimatedTokens)
+              )} tokens. System ${fmt(amount(measure.system))} \xB7 tool definitions ${fmt(
+                amount(measure.toolDefinitions)
+              )} \xB7 text ${fmt(amount(measure.text))} \xB7 reasoning ${fmt(amount(measure.reasoning))} \xB7 media ${fmt(
+                amount(measure.media)
+              )} \xB7 tool results ${fmt(amount(measure.toolResults))} \xB7 tool inputs ${fmt(amount(measure.toolInputs))}.`
+            )
+          );
+        }
+        if (last && last.sessionId === sessionId()) {
+          const budgetOver = amount(last.budgetOver);
+          const pruneErrors = amount(last.pruneErrors);
+          if (budgetOver > 0) {
+            breakdown.append(
+              el2(
+                "div",
+                "fb-note",
+                `Budget still exceeded by ${fmt(budgetOver)} chars after eviction: only protected or non-removable content remained.`
+              )
+            );
+          }
+          if (pruneErrors > 0) {
+            breakdown.append(
+              el2(
+                "div",
+                "fb-note",
+                `${fmt(pruneErrors)} pruning stage${pruneErrors === 1 ? "" : "s"} failed on the latest request.`
+              )
+            );
+          }
         }
       } else if (entry && runs > 0) {
         breakdown.append(el2("div", "fb-empty", "No latest-request breakdown yet."));
@@ -7265,6 +7554,10 @@ ${report}`,
   }
   function stopSessions() {
     sessionsToken += 1;
+    if (sessionsRetryTimer !== void 0) {
+      window.clearTimeout(sessionsRetryTimer);
+      sessionsRetryTimer = void 0;
+    }
     try {
       sessionsStop?.();
     } catch {
@@ -7292,17 +7585,44 @@ ${report}`,
         return;
       }
       sessionsStop = stop;
-    } catch {
+    } catch (error) {
       if (token === sessionsToken) currentSessionRecord = null;
+      const code = errorCode(error);
+      if (token === sessionsToken && id === projectId && code !== "NOT_GRANTED" && code !== "UNSUPPORTED") {
+        if (sessionsRetryTimer !== void 0) window.clearTimeout(sessionsRetryTimer);
+        sessionsRetryTimer = window.setTimeout(() => {
+          sessionsRetryTimer = void 0;
+          if (token === sessionsToken && id === projectId) void subscribeSessions();
+        }, 5e3);
+      }
     }
+  }
+  function clearProjectRetry() {
+    if (projectRetryTimer !== void 0) {
+      window.clearTimeout(projectRetryTimer);
+      projectRetryTimer = void 0;
+    }
+  }
+  function scheduleProjectRetry() {
+    if (projectRetryTimer !== void 0 || !ready?.directory) return;
+    const delay = projectRetryDelay;
+    projectRetryDelay = Math.min(6e4, projectRetryDelay * 2);
+    projectRetryTimer = window.setTimeout(() => {
+      projectRetryTimer = void 0;
+      if (!ready?.directory) return;
+      void syncProject().catch(() => {
+      });
+    }, delay);
   }
   async function syncProject() {
     const seq = ++syncSeq;
+    clearProjectRetry();
     const directory = ready?.directory;
     const nextStatusKey = statusFileKey(directory);
     if (nextStatusKey !== statusKey) {
       statusKey = nextStatusKey;
       pluginStatus = null;
+      stopSessions();
     }
     const fallbackKey = normalizeDir(directory);
     projectKey = fallbackKey;
@@ -7310,11 +7630,14 @@ ${report}`,
     handles["context-brief"]?.update({ value: currentBrief(), disabled: true });
     if (!directory) {
       projectId = null;
+      projectRetryDelay = 5e3;
       handles["context-brief"]?.update({ value: currentBrief(), disabled: false });
       stopSessions();
       refreshAll();
       return;
     }
+    let resolved = false;
+    let retryable = true;
     try {
       const projects = await host.listProjects();
       if (seq !== syncSeq) return;
@@ -7323,14 +7646,26 @@ ${report}`,
       );
       projectId = match?.id ?? null;
       projectKey = normalizeDir(match?.directory) || fallbackKey;
-    } catch {
+      resolved = Boolean(projectId);
+    } catch (error) {
       if (seq !== syncSeq) return;
       projectId = null;
+      const code = errorCode(error);
+      retryable = code !== "NOT_GRANTED" && code !== "UNSUPPORTED";
     }
     if (seq !== syncSeq) return;
     handles["context-brief"]?.update({ value: currentBrief(), disabled: false });
-    await subscribeSessions();
-    if (seq !== syncSeq) return;
+    if (!resolved) {
+      if (retryable) scheduleProjectRetry();
+    } else {
+      projectRetryDelay = 5e3;
+      if (sessionsRetryTimer !== void 0) {
+        window.clearTimeout(sessionsRetryTimer);
+        sessionsRetryTimer = void 0;
+      }
+      await subscribeSessions();
+      if (seq !== syncSeq) return;
+    }
     refreshAll();
   }
   async function refreshPluginStatus() {
@@ -7344,7 +7679,8 @@ ${report}`,
     }
     try {
       let content = null;
-      for (const path of [projectStatusPath(), LEGACY_STATUS_PATH]) {
+      const statusPaths = ready?.directory ? [projectStatusPath()] : [projectStatusPath(), LEGACY_STATUS_PATH];
+      for (const path of statusPaths) {
         try {
           const result = await host.readFile(path);
           content = result.content;
@@ -7405,22 +7741,33 @@ ${report}`,
   }
   function normalizeSpark(value) {
     const scores = value.scores;
-    return {
+    const spark = {
       id: value.id,
       title: String(value.title ?? "").slice(0, 160),
       note: String(value.note ?? "").slice(0, NOTE_MAX),
-      createdAt: Number(value.createdAt) || Date.now(),
-      scores: scores && typeof scores === "object" ? {
+      createdAt: Number(value.createdAt) || Date.now()
+    };
+    if (scores && typeof scores === "object") {
+      spark.scores = {
         novelty: clampInt(scores.novelty, 1, 5, 3),
         usefulness: clampInt(scores.usefulness, 1, 5, 3),
         fit: clampInt(scores.fit, 1, 5, 3),
         effort: clampInt(scores.effort, 1, 5, 3)
-      } : void 0
-    };
+      };
+    }
+    return spark;
   }
   async function loadStorage() {
     characters = [];
     sparks = [];
+    characterCache.clear();
+    sparkCache.clear();
+    retainedCharacterIds.clear();
+    retainedSparkIds.clear();
+    charactersLoaded = false;
+    sparksLoaded = false;
+    charactersSaveWarned = false;
+    sparksSaveWarned = false;
     let legacyCharacters = false;
     let legacySparks = false;
     try {
@@ -7431,18 +7778,28 @@ ${report}`,
           ids.map((id) => host.storage.get(characterKey(id)).catch(() => void 0))
         );
         characters = loaded.filter(isCharacter).map(normalizeCharacter).slice(0, 40);
+        for (let position = 0; position < ids.length; position += 1) {
+          if (!isCharacter(loaded[position])) retainedCharacterIds.add(ids[position]);
+        }
         selectedCharacterId = characters[0]?.id ?? null;
+        charactersLoaded = true;
       } else {
         const legacy = await host.storage.get("characters");
         if (Array.isArray(legacy)) {
           legacyCharacters = true;
           characters = legacy.filter(isCharacter).map(normalizeCharacter).slice(0, 40);
           selectedCharacterId = characters[0]?.id ?? null;
-          if (characters.length) persistCharacters();
+          charactersLoaded = true;
+          if (characters.length) {
+            charactersTouched = true;
+            persistCharacters();
+          }
+        } else if (legacy === void 0) {
+          charactersLoaded = true;
         }
       }
     } catch {
-      characters = [];
+      charactersLoaded = false;
     }
     try {
       const index = await host.storage.get(SPARK_INDEX_KEY);
@@ -7452,16 +7809,26 @@ ${report}`,
           ids.map((id) => host.storage.get(sparkKey(id)).catch(() => void 0))
         );
         sparks = loaded.filter(isSpark).map(normalizeSpark).slice(0, 60);
+        for (let position = 0; position < ids.length; position += 1) {
+          if (!isSpark(loaded[position])) retainedSparkIds.add(ids[position]);
+        }
+        sparksLoaded = true;
       } else {
         const legacy = await host.storage.get("sparks");
         if (Array.isArray(legacy)) {
           legacySparks = true;
           sparks = legacy.filter(isSpark).map(normalizeSpark).slice(0, 60);
-          if (sparks.length) persistSparks();
+          sparksLoaded = true;
+          if (sparks.length) {
+            sparksTouched = true;
+            persistSparks();
+          }
+        } else if (legacy === void 0) {
+          sparksLoaded = true;
         }
       }
     } catch {
-      sparks = [];
+      sparksLoaded = false;
     }
     if (!legacyCharacters) {
       characterCache.clear();
@@ -7493,6 +7860,12 @@ ${report}`,
           "Fox Box could not load its config file, so changes stay in memory only. Fix or remove ~/.config/openchamber/fox-box/config.json, or approve Fox Box's file access, then reopen the panel."
         );
         configSaveWarned = true;
+      } else if (!charactersLoaded || !sparksLoaded) {
+        showBanner(
+          "warning",
+          "Saved data could not be read",
+          "Fox Box will not overwrite saved characters or ideas. Reopen the panel to try loading them again."
+        );
       }
       booted = true;
       booting = false;
@@ -7578,24 +7951,29 @@ ${report}`,
   });
   window.addEventListener("pagehide", () => {
     stopSessions();
+    clearProjectRetry();
     if (statusTimer !== void 0) {
       window.clearInterval(statusTimer);
       statusTimer = void 0;
     }
+    const hadConfigTimer = configTimer !== void 0;
     if (configTimer !== void 0) {
       window.clearTimeout(configTimer);
       configTimer = void 0;
-      void saveConfigNow();
     }
-    if (charactersTouched) saveCharactersNow();
-    if (sparksTouched) saveSparksNow();
-    try {
-      bannerHandle?.dispose();
-    } catch {
-    }
-    try {
-      host.dispose();
-    } catch {
-    }
+    const writes = [];
+    if (hadConfigTimer || configPending || savingConfig) writes.push(saveConfigNow());
+    if (charactersTouched || charactersSaving) writes.push(saveCharactersNow());
+    if (sparksTouched || sparksSaving) writes.push(saveSparksNow());
+    void Promise.allSettled(writes).finally(() => {
+      try {
+        bannerHandle?.dispose();
+      } catch {
+      }
+      try {
+        host.dispose();
+      } catch {
+      }
+    });
   });
 })();

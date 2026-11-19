@@ -9,6 +9,8 @@
  * Both live in ~/.config/openchamber/fox-box/ (FOXBOX_HOME overrides it for tests).
  */
 
+import { pruneContext } from "./context.js";
+
 const DEFAULT_CONTRACT = [
   "Fox Box small-model contract:",
   "- Work in small, verifiable steps. Do not start a second step before the first has a visible result.",
@@ -49,7 +51,7 @@ const MODEL_PRESETS = {
 };
 
 const STATE = {
-  version: 3,
+  version: 4,
   stopped: false,
   loadedAt: 0,
   updatedAt: 0,
@@ -69,6 +71,16 @@ const STATE = {
     otherChars: 0,
     toolResults: 0,
     trimmedResults: 0,
+    supersededChars: 0,
+    staleChars: 0,
+    compactedChars: 0,
+    receiptChars: 0,
+    budgetChars: 0,
+    superseded: 0,
+    stale: 0,
+    compacted: 0,
+    receipts: 0,
+    budgetEvicted: 0,
   },
   sessions: {},
   last: null,
@@ -137,6 +149,16 @@ function defaults() {
         maxToolOutput: 48000,
         maxOldToolOutput: 6000,
         protectPaths: "",
+        pathSupersession: true,
+        staleReads: true,
+        mergeReadRanges: true,
+        editReceipts: true,
+        receiptMinChars: 1200,
+        smartCompaction: true,
+        skeletonCodeReads: true,
+        budgetTokens: 0,
+        charsPerToken: 4,
+        relevanceScoring: true,
         briefs: {},
       },
       model: {
@@ -217,6 +239,31 @@ function normalizeConfig(input) {
           base.powers.context.maxOldToolOutput,
         ),
         protectPaths: typeof context.protectPaths === "string" ? context.protectPaths.slice(0, 4000) : "",
+        pathSupersession: context.pathSupersession !== false,
+        staleReads: context.staleReads !== false,
+        mergeReadRanges: context.mergeReadRanges !== false,
+        editReceipts: context.editReceipts !== false,
+        receiptMinChars: clampInt(
+          context.receiptMinChars ?? base.powers.context.receiptMinChars,
+          200,
+          20000,
+          base.powers.context.receiptMinChars,
+        ),
+        smartCompaction: context.smartCompaction !== false,
+        skeletonCodeReads: context.skeletonCodeReads !== false,
+        budgetTokens: clampInt(
+          context.budgetTokens ?? base.powers.context.budgetTokens,
+          0,
+          2000000,
+          base.powers.context.budgetTokens,
+        ),
+        charsPerToken: clampNumber(
+          context.charsPerToken ?? base.powers.context.charsPerToken,
+          1,
+          20,
+          base.powers.context.charsPerToken,
+        ),
+        relevanceScoring: context.relevanceScoring !== false,
         briefs,
       },
       model: {
@@ -374,6 +421,16 @@ function ensureSessionEntry(sessionID) {
     keptChars: 0,
     toolResults: 0,
     trimmedResults: 0,
+    supersededChars: 0,
+    staleChars: 0,
+    compactedChars: 0,
+    receiptChars: 0,
+    budgetChars: 0,
+    superseded: 0,
+    stale: 0,
+    compacted: 0,
+    receipts: 0,
+    budgetEvicted: 0,
     protectedReads: 0,
     lastSaved: 0,
     lastKept: 0,
@@ -385,6 +442,17 @@ function ensureSessionEntry(sessionID) {
     lastOther: 0,
     lastToolResults: 0,
     lastTrimmedResults: 0,
+    lastSuperseded: 0,
+    lastSupersededChars: 0,
+    lastStale: 0,
+    lastStaleChars: 0,
+    lastCompacted: 0,
+    lastCompactedChars: 0,
+    lastReceipts: 0,
+    lastReceiptChars: 0,
+    lastBudgetEvicted: 0,
+    lastBudgetChars: 0,
+    lastMeasure: null,
     history: [],
     lastAt: 0,
   };
@@ -400,609 +468,13 @@ function touchSession(sessionID, model) {
   return entry;
 }
 
-function inputPaths(input) {
-  const paths = [];
-  if (typeof input === "string" && input.trim()) return [input];
-  if (!input || typeof input !== "object") return paths;
-  for (const key of ["path", "filePath", "file", "filename", "target", "pattern", "glob", "include"]) {
-    const value = input[key];
-    if (typeof value === "string" && value) paths.push(value);
-  }
-  return paths;
+/* Conversation characters are exactly what the old ledger measured: the request
+   itself, not the contract, brief, or tool definitions sent beside it. */
+function conversationChars(measurement) {
+  if (!measurement || typeof measurement !== "object") return 0;
+  return Math.max(0, Number(measurement.chars || 0) - Number(measurement.system || 0) - Number(measurement.toolDefinitions || 0));
 }
 
-function isSkillCall(toolName, input) {
-  if (/skill/i.test(String(toolName || ""))) return true;
-  for (const path of inputPaths(input)) {
-    const text = path.replace(/\\/g, "/");
-    if (/(^|\/)skills\//i.test(text) || /(^|\/)skill\.md$/i.test(text)) return true;
-  }
-  return false;
-}
-
-function looksLikeSkillResult(result) {
-  if (!result || typeof result !== "object") return false;
-  let head = "";
-  if (result.type === "text" && typeof result.value === "string") {
-    head = result.value.slice(0, 4000);
-  } else if (result.type === "content" && Array.isArray(result.value)) {
-    for (const part of result.value) {
-      if (!part || part.type !== "text" || typeof part.text !== "string") continue;
-      head += part.text.slice(0, 4000);
-      if (head.length >= 4000) break;
-    }
-  }
-  return /\bSKILL\.md\b/i.test(head) || /(^|\/)skills\//i.test(head);
-}
-
-function globToRegex(pattern) {
-  const escaped = pattern
-    .replace(/\\/g, "/")
-    .replace(/\*\*\//g, "\u0001")
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "\u0000")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, ".")
-    .replace(/\u0001/g, "(?:.*/)?")
-    .replace(/\u0000/g, ".*");
-  try {
-    return new RegExp(`^${escaped}$`, "i");
-  } catch {
-    return null;
-  }
-}
-
-function protectedInputPaths(input) {
-  const paths = [];
-  if (!input || typeof input !== "object") return paths;
-  for (const key of ["path", "filePath", "file", "filename", "target"]) {
-    const value = input[key];
-    if (typeof value === "string" && value) paths.push(value);
-  }
-  return paths;
-}
-
-function createProtectMatcher(protectPaths) {
-  if (!protectPaths || !protectPaths.trim()) return () => false;
-  const patterns = protectPaths
-    .split(/\r?\n/)
-    .map((line) => line.trim().replace(/^\.\//, ""))
-    .filter(Boolean)
-    .slice(0, 80)
-    .map((pattern) => {
-      if (pattern.includes("*") || pattern.includes("?")) {
-        return { regex: globToRegex(pattern), text: "" };
-      }
-      return {
-        regex: null,
-        text: pattern
-          .replace(/\\/g, "/")
-          .replace(/^\/+/, "")
-          .replace(/\/+$/, "")
-          .toLowerCase(),
-      };
-    })
-    .filter((pattern) => pattern.regex || pattern.text);
-  if (!patterns.length) return () => false;
-  return (input) => {
-    const paths = protectedInputPaths(input).map((path) => path.replace(/\\/g, "/"));
-    if (!paths.length) return false;
-    for (const path of paths) {
-      let relative = path;
-      const lower = path.toLowerCase();
-      if (projectKey && lower.startsWith(`${projectKey}/`)) {
-        relative = path.slice(projectKey.length + 1);
-      }
-      const lowerPath = path.toLowerCase();
-      const lowerRelative = relative.toLowerCase();
-      for (const pattern of patterns) {
-        if (pattern.regex) {
-          if (pattern.regex.test(path) || (relative !== path && pattern.regex.test(relative))) return true;
-          continue;
-        }
-        if (!pattern.text) continue;
-        if (
-          lowerPath === pattern.text ||
-          lowerPath.endsWith(`/${pattern.text}`) ||
-          lowerPath.startsWith(`${pattern.text}/`) ||
-          lowerPath.includes(`/${pattern.text}/`) ||
-          lowerRelative === pattern.text ||
-          lowerRelative.endsWith(`/${pattern.text}`) ||
-          lowerRelative.startsWith(`${pattern.text}/`) ||
-          lowerRelative.includes(`/${pattern.text}/`)
-        ) {
-          return true;
-        }
-      }
-    }
-    return false;
-  };
-}
-
-function matchesProtected(input, protectPaths) {
-  return createProtectMatcher(protectPaths)(input);
-}
-
-const READ_TOOL_NAMES = new Set(["read", "read_file"]);
-const COLLAPSIBLE_TOOL_NAMES = new Set([
-  "read",
-  "read_file",
-  "grep",
-  "glob",
-  "list",
-  "find",
-  "webfetch",
-  "websearch",
-  "bash",
-  "shell",
-  "skill",
-]);
-const COLLAPSED_STUB_PREFIX = "[Fox Box: duplicate ";
-
-function firstInputPath(input) {
-  if (!input || typeof input !== "object") return "";
-  for (const key of ["filePath", "path", "file", "filename"]) {
-    const value = input[key];
-    if (typeof value === "string" && value) return value;
-  }
-  return "";
-}
-
-function normalizePathKey(value) {
-  let text = String(value || "")
-    .replace(/\\/g, "/")
-    .replace(/\/+/g, "/")
-    .trim();
-  while (text.startsWith("./")) text = text.slice(2);
-  if (text && !text.startsWith("/") && !/^[a-z]:\//i.test(text) && projectKey) {
-    text = `${projectKey}/${text}`;
-  }
-  const caseInsensitive =
-    typeof process !== "undefined" && (process.platform === "win32" || process.platform === "darwin");
-  return caseInsensitive ? text.toLowerCase() : text;
-}
-
-function stableStringify(value, depth = 0) {
-  if (value === null || typeof value !== "object") {
-    try {
-      return JSON.stringify(value) ?? String(value);
-    } catch {
-      return String(value);
-    }
-  }
-  if (depth >= 6) return '"…"';
-  if (Array.isArray(value)) {
-    return `[${value.slice(0, 100).map((item) => stableStringify(item, depth + 1)).join(",")}]`;
-  }
-  const keys = Object.keys(value).sort().slice(0, 100);
-  return `{${keys
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key], depth + 1)}`)
-    .join(",")}}`;
-}
-
-function toolCallKey(name, input) {
-  const tool = String(name || "tool").toLowerCase();
-  if (READ_TOOL_NAMES.has(tool)) {
-    const path = normalizePathKey(firstInputPath(input));
-    if (path) {
-      const offset = Number(input && (input.offset ?? input.startLine ?? input.start));
-      const limit = Number(input && input.limit);
-      const end = Number(input && (input.endLine ?? input.end));
-      const start = Number.isFinite(offset) && offset > 0 ? Math.round(offset) : 0;
-      const size = Number.isFinite(limit) && limit > 0 ? Math.round(limit) : 0;
-      const endLine = Number.isFinite(end) && end > 0 ? Math.round(end) : 0;
-      return `read|${path}|${start}|${size}|${endLine}`;
-    }
-  }
-  const key = `${tool}|${stableStringify(input)}`;
-  return key.length > 8000 ? `${key.slice(0, 7950)}…${key.length.toString(36)}` : key;
-}
-
-function resultTextLength(result) {
-  if (!result || typeof result !== "object") return 0;
-  if (result.type === "text" && typeof result.value === "string") return result.value.length;
-  /* OpenCode tool results can be structured JSON. It is still text the model reads,
-     so it belongs in the ledger; it is counted, not rewritten. */
-  if (result.type === "json" && result.value !== undefined && result.value !== null) {
-    try {
-      return stableStringify(result.value).length;
-    } catch {
-      return 0;
-    }
-  }
-  if (result.type === "content" && Array.isArray(result.value)) {
-    let length = 0;
-    for (const part of result.value) {
-      if (part && part.type === "text" && typeof part.text === "string") length += part.text.length;
-    }
-    return length;
-  }
-  return 0;
-}
-
-function countToolResultParts(messages) {
-  if (!Array.isArray(messages)) return 0;
-  let count = 0;
-  for (const message of messages) {
-    if (!message || !Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      if (part && part.type === "tool-result") count += 1;
-    }
-  }
-  return count;
-}
-
-/*
- * Count the characters a model actually reads in the outgoing conversation.
- * Text parts, tool-result text (including structured JSON results), and tool-call
- * arguments are included; images and other binary parts are not, because their
- * prompt cost is tokenizer specific. Taking this before and after trimming gives the exact number of
- * characters Fox Box removed, independent of which trim path did the work.
- */
-function messageCharCount(messages) {
-  if (!Array.isArray(messages)) return 0;
-  let total = 0;
-  for (const message of messages) {
-    if (!message) continue;
-    const content = message.content;
-    if (typeof content === "string") {
-      total += content.length;
-      continue;
-    }
-    if (!Array.isArray(content)) continue;
-    for (const part of content) {
-      if (!part || typeof part !== "object") continue;
-      if (part.type === "text" && typeof part.text === "string") {
-        total += part.text.length;
-      } else if (part.type === "tool-result") {
-        total += resultTextLength(part.result);
-      } else if (part.type === "tool-call" && part.input !== undefined && part.input !== null) {
-        try {
-          total += stableStringify(part.input).length;
-        } catch {
-          // An unreadable input simply contributes nothing.
-        }
-      }
-    }
-  }
-  return total;
-}
-
-function isCollapsedStub(result) {
-  if (!result || typeof result !== "object") return false;
-  if (result.type === "text" && typeof result.value === "string") {
-    return result.value.startsWith(COLLAPSED_STUB_PREFIX);
-  }
-  if (result.type === "content" && Array.isArray(result.value)) {
-    const first = result.value.find((part) => part && part.type === "text");
-    return Boolean(first && typeof first.text === "string" && first.text.startsWith(COLLAPSED_STUB_PREFIX));
-  }
-  return false;
-}
-
-function oneLine(value, max) {
-  return String(value || "").replace(/[\r\n\t]+/g, " ").slice(0, max);
-}
-
-function duplicateStub(name, displayPath) {
-  const isRead = READ_TOOL_NAMES.has(String(name || "").toLowerCase());
-  const label = isRead && displayPath ? `read of ${oneLine(displayPath, 180)}` : `${oneLine(name || "tool", 80)} call`;
-  return `${COLLAPSED_STUB_PREFIX}${label} collapsed. The newest result is later in this request; use it instead of repeating the call.]`;
-}
-
-function countNewlines(text) {
-  let count = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    if (text.charCodeAt(index) === 10) count += 1;
-  }
-  return count;
-}
-
-function trimReadText(text, max, reason, meta) {
-  const totalLines = countNewlines(text) + 1;
-  if (totalLines < 3) return null;
-  const rawOffset = Number(meta && meta.input && (meta.input.offset ?? meta.input.startLine ?? meta.input.start));
-  const startLine = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.round(rawOffset) : 1;
-  const endLine = startLine + totalLines - 1;
-  const path = firstInputPath(meta && meta.input);
-  const where = path ? ` from ${oneLine(path, 120)}` : "";
-  const kind = reason === "old" ? "older read" : reason === "kept" ? "latest read" : "fresh result";
-  const readName = String((meta && meta.tool) || "read");
-  const attempt = (headRatio, tailRatio) => {
-    const headBudget = Math.max(200, Math.floor(max * headRatio));
-    const tailBudget = Math.max(120, Math.floor(max * tailRatio));
-    let headCut = text.lastIndexOf("\n", headBudget);
-    if (headCut < Math.floor(headBudget * 0.45)) headCut = headBudget;
-    let tailStart = text.indexOf("\n", Math.max(0, text.length - tailBudget));
-    if (tailStart < 0) tailStart = text.length - tailBudget;
-    else tailStart += 1;
-    if (tailStart > text.length - Math.floor(tailBudget * 0.3)) tailStart = text.length - tailBudget;
-    if (headCut <= 0 || tailStart <= headCut || tailStart >= text.length) return null;
-    const headLines = countNewlines(text.slice(0, headCut)) + 1;
-    const tailLines = countNewlines(text.slice(tailStart)) + 1;
-    const headEndLine = startLine + headLines - 1;
-    const tailStartLine = endLine - tailLines + 1;
-    const gapStart = headEndLine + 1;
-    const gapEnd = tailStartLine - 1;
-    if (gapEnd < gapStart) return null;
-    const label = [
-      `Fox Box kept lines ${startLine}–${headEndLine} and ${tailStartLine}–${endLine}${where} (${kind}, cap ${max.toLocaleString()} chars). `,
-      `Lines ${gapStart}–${gapEnd} are omitted. To read the gap, call ${readName} with offset=${gapStart} limit=${gapEnd - gapStart + 1} instead of repeating the whole file.`,
-    ].join("");
-    const headText = text.slice(0, headCut);
-    const tailText = text.slice(tailStart);
-    const marker = `\n\n… [${label}] …\n\n`;
-    if (headText.length + tailText.length + marker.length > max) return null;
-    const output = `${headText}${marker}${tailText}`;
-    return { text: output, saved: Math.max(0, text.length - output.length) };
-  };
-  /* Use as much of the cap as the marker allows; fall back to a tighter split, then to a char cut. */
-  return attempt(0.62, 0.24) ?? attempt(0.56, 0.2) ?? null;
-}
-
-function trimText(text, max, reason, meta) {
-  if (typeof text !== "string" || text.length <= max) return { text, saved: 0 };
-  if (meta && READ_TOOL_NAMES.has(String(meta.tool || "").toLowerCase())) {
-    const readTrimmed = trimReadText(text, max, reason, meta);
-    if (readTrimmed) return readTrimmed;
-  }
-  const kind = reason === "fresh" ? "fresh result" : reason === "kept" ? "latest read" : "old result";
-  /* trimText always ends at exactly `max` characters below, so state the cap and the
-     original size. An estimated "removed" count here used to overstate the saving. */
-  const label =
-    reason === "old"
-      ? `Fox Box trimmed an old result to ${max.toLocaleString()} chars (was ${text.length.toLocaleString()}).`
-      : `Fox Box kept the first and last part of this ${kind}: capped at ${max.toLocaleString()} chars (was ${text.length.toLocaleString()}). If the missing middle matters, request only that range or narrow the call instead of repeating it.`;
-  let marker = `\n\n… [${label}] …\n\n`;
-  if (marker.length >= max) marker = "\n… [Fox Box trimmed] …\n";
-  if (marker.length >= max) {
-    const output = text.slice(0, max);
-    return { text: output, saved: Math.max(0, text.length - output.length) };
-  }
-  const room = max - marker.length;
-  const head = Math.max(1, Math.floor(room * 0.68));
-  const tail = Math.max(0, room - head);
-  const tailText = tail > 0 ? text.slice(-tail) : "";
-  const output = `${text.slice(0, head)}${marker}${tailText}`;
-  return {
-    text: output,
-    saved: Math.max(0, text.length - output.length),
-  };
-}
-
-function trimResult(result, max, reason, meta) {
-  if (!result || typeof result !== "object") return { result, saved: 0 };
-  if (result.type === "text" && typeof result.value === "string") {
-    const trimmed = trimText(result.value, max, reason, meta);
-    if (trimmed.saved > 0) return { result: { ...result, value: trimmed.text }, saved: trimmed.saved };
-    return { result, saved: 0 };
-  }
-  if (result.type === "content" && Array.isArray(result.value)) {
-    const kind = reason === "fresh" ? "fresh result" : reason === "kept" ? "latest read" : "old result";
-    const marker = `[Fox Box: later text in this ${kind} was trimmed]`;
-    let budget = Math.max(0, max - marker.length);
-    let originalText = 0;
-    let dropped = false;
-    const value = [];
-    for (const part of result.value) {
-      if (!part || part.type !== "text" || typeof part.text !== "string") {
-        value.push(part);
-        continue;
-      }
-      originalText += part.text.length;
-      if (budget <= 0) {
-        dropped = true;
-        continue;
-      }
-      if (part.text.length > budget) {
-        const trimmed = trimText(part.text, budget, reason, meta);
-        value.push({ ...part, text: trimmed.text });
-        budget = 0;
-        continue;
-      }
-      budget -= part.text.length;
-      value.push(part);
-    }
-    if (dropped) value.push({ type: "text", text: marker });
-    let replacementText = 0;
-    for (const part of value) {
-      if (part && part.type === "text" && typeof part.text === "string") replacementText += part.text.length;
-    }
-    const saved = Math.max(0, originalText - replacementText);
-    if (saved > 0) return { result: { ...result, value }, saved };
-  }
-  return { result, saved: 0 };
-}
-
-function toolCallMap(messages) {
-  const calls = new Map();
-  for (const message of messages) {
-    if (!message || !Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      if (part && part.type === "tool-call" && part.id) calls.set(part.id, part);
-    }
-  }
-  return calls;
-}
-
-function isProtectedResult(name, part, call, context, protect) {
-  if (context.protectSkills && isSkillCall(name, call && call.input)) return true;
-  if (context.protectSkills && looksLikeSkillResult(part.result)) return true;
-  const matches = protect || ((input) => matchesProtected(input, context.protectPaths));
-  if (matches(call && call.input)) return true;
-  return false;
-}
-
-function collectToolResultEntries(messages, context, calls) {
-  const entries = [];
-  const protect = createProtectMatcher(context.protectPaths);
-  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
-    const message = messages[messageIndex];
-    if (!message || message.role !== "tool" || !Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      if (!part || part.type !== "tool-result") continue;
-      const call = calls.get(part.id);
-      const name = String(part.name || (call && call.name) || "");
-      const input = call && call.input;
-      const displayPath = firstInputPath(input);
-      const pathKey = normalizePathKey(displayPath);
-      const protectedResult = isProtectedResult(name, part, call, context, protect);
-      const toolName = String(name || "").toLowerCase();
-      const collapsible = COLLAPSIBLE_TOOL_NAMES.has(toolName);
-      /* Keep large write/edit payloads out of the duplicate key. Non-collapsible protected
-         results still share a logical path key so only their newest copy stays whole. */
-      const key = collapsible
-        ? call
-          ? toolCallKey(name, input)
-          : `${name || "tool"}|id:${part.id || entries.length}`
-        : protectedResult
-          ? pathKey
-            ? `protected|${toolName || "tool"}|${pathKey}`
-            : `${name || "tool"}|id:${part.id || entries.length}`
-          : "";
-      entries.push({
-        index: entries.length,
-        messageIndex,
-        part,
-        name,
-        input,
-        displayPath,
-        pathKey,
-        key,
-        protected: protectedResult,
-        collapsed: false,
-      });
-    }
-  }
-  return entries;
-}
-
-function collapseDuplicateEntries(entries, context) {
-  if (context.collapseDuplicates === false) return { collapsed: 0, chars: 0 };
-  const groups = new Map();
-  for (const entry of entries) {
-    if (!COLLAPSIBLE_TOOL_NAMES.has(String(entry.name || "").toLowerCase())) continue;
-    if (isCollapsedStub(entry.part.result)) continue;
-    const list = groups.get(entry.key);
-    if (list) list.push(entry);
-    else groups.set(entry.key, [entry]);
-  }
-  let collapsed = 0;
-  let chars = 0;
-  for (const list of groups.values()) {
-    if (list.length < 2) continue;
-    const newest = list[list.length - 1];
-    if (!newest.part.result || newest.part.result.type === "error" || isCollapsedStub(newest.part.result)) continue;
-    /* An empty or failed-looking newer result must not erase a useful older one. */
-    if (resultTextLength(newest.part.result) < 16) continue;
-    /* Do not replace a protected older read with an empty/failed newer one. */
-    if (newest.protected && resultTextLength(newest.part.result) < 100) continue;
-    for (const entry of list.slice(0, -1)) {
-      if (entry.collapsed || isCollapsedStub(entry.part.result)) continue;
-      const before = resultTextLength(entry.part.result);
-      const stub = duplicateStub(entry.name, entry.displayPath);
-      if (stub.length >= before) continue;
-      entry.part.result = { type: "text", value: stub };
-      entry.collapsed = true;
-      collapsed += 1;
-      chars += before - stub.length;
-    }
-  }
-  return { collapsed, chars };
-}
-
-function latestProtectedEntries(entries) {
-  const latest = new Map();
-  for (const entry of entries) {
-    if (entry.collapsed || !entry.protected || isCollapsedStub(entry.part.result)) continue;
-    if (!entry.part.result || entry.part.result.type === "error") continue;
-    /* A failed or tiny re-read must not displace the last useful protected copy. */
-    if (resultTextLength(entry.part.result) < 100) continue;
-    latest.set(entry.key, entry);
-  }
-  return latest;
-}
-
-function latestReadEntries(entries) {
-  const latest = new Map();
-  const protectedPaths = new Set();
-  for (const entry of entries) {
-    if (entry.protected && entry.pathKey) protectedPaths.add(entry.pathKey);
-  }
-  for (const entry of entries) {
-    if (entry.collapsed || entry.protected || isCollapsedStub(entry.part.result)) continue;
-    if (!entry.pathKey || protectedPaths.has(entry.pathKey)) continue;
-    if (!READ_TOOL_NAMES.has(String(entry.name || "").toLowerCase())) continue;
-    if (!entry.part.result || entry.part.result.type === "error") continue;
-    if (resultTextLength(entry.part.result) < 16) continue;
-    latest.set(entry.pathKey, entry);
-  }
-  return latest;
-}
-
-/*
- * Protect and trim the outgoing request only. In order:
- *  1. Collapse repeated discovery calls, keeping the newest result and replacing older copies.
- *  2. Keep the newest copy of every skill/pinned result whole, no matter how old it is.
- *  3. Keep the newest read of up to `protectedReads` files at the fresh cap even when old.
- *  4. Cap every other result at the fresh or old budget.
- * Stored history is never rewritten; a cap change takes effect on the next request.
- */
-function trimToolResults(messages, context) {
-  const empty = { old: 0, fresh: 0, collapsed: 0, collapsedChars: 0, protectedReads: 0, trimmed: 0 };
-  if (!Array.isArray(messages) || messages.length === 0) return empty;
-  const trimEnabled = context.trimToolOutput !== false;
-  if (!trimEnabled && context.collapseDuplicates === false) return empty;
-  const keep = Math.max(2, Math.min(40, Number(context.keepRecent) || 10));
-  const cutoff = Math.max(0, messages.length - keep);
-  const calls = toolCallMap(messages);
-  const entries = collectToolResultEntries(messages, context, calls);
-  const collapse = collapseDuplicateEntries(entries, context);
-  const protectedLatest = trimEnabled ? latestProtectedEntries(entries) : new Map();
-  const latestReads = trimEnabled ? latestReadEntries(entries) : new Map();
-  const configuredReads = context.protectedReads === undefined ? 6 : Number(context.protectedReads);
-  const readLimit = Number.isFinite(configuredReads) ? Math.max(0, Math.min(12, Math.round(configuredReads))) : 6;
-  const keptReadEntries = new Set(
-    Array.from(latestReads.values())
-      .filter((entry) => entry.messageIndex < cutoff)
-      .sort((a, b) => b.index - a.index)
-      .slice(0, readLimit)
-      .map((entry) => entry.index),
-  );
-  const oldMax = Math.max(1000, Math.min(64000, Number(context.maxOldToolOutput) || 6000));
-  const freshMax = Math.max(2000, Math.min(256000, Number(context.maxToolOutput) || 48000));
-  let oldSaved = 0;
-  let freshSaved = 0;
-  let trimmedResults = 0;
-  if (trimEnabled) {
-    for (const entry of entries) {
-      if (entry.collapsed || isCollapsedStub(entry.part.result)) continue;
-      const isOld = entry.messageIndex < cutoff;
-      if (entry.protected && protectedLatest.get(entry.key) === entry) continue;
-      const isKeptRead = isOld && keptReadEntries.has(entry.index);
-      const max = isOld && !isKeptRead ? oldMax : freshMax;
-      const reason = isOld && !isKeptRead ? "old" : isKeptRead ? "kept" : "fresh";
-      const outcome = trimResult(entry.part.result, max, reason, {
-        tool: entry.name,
-        input: entry.input,
-      });
-      if (outcome.saved > 0) {
-        entry.part.result = outcome.result;
-        trimmedResults += 1;
-        if (isOld && !isKeptRead) oldSaved += outcome.saved;
-        else freshSaved += outcome.saved;
-      }
-    }
-  }
-  return {
-    old: oldSaved,
-    fresh: freshSaved,
-    collapsed: collapse.collapsed,
-    collapsedChars: collapse.chars,
-    protectedReads: keptReadEntries.size,
-    trimmed: trimmedResults,
-  };
-}
 
 export default {
   id: "fox-box",
@@ -1031,7 +503,28 @@ export default {
           let savedChars = 0;
           let otherChars = 0;
           let toolResults = 0;
-          let trimmed = { old: 0, fresh: 0, collapsed: 0, collapsedChars: 0, protectedReads: 0, trimmed: 0 };
+          let measurement = null;
+          let trimmed = {
+            old: 0,
+            fresh: 0,
+            collapsed: 0,
+            collapsedChars: 0,
+            superseded: 0,
+            merged: 0,
+            supersededChars: 0,
+            stale: 0,
+            staleChars: 0,
+            compacted: 0,
+            compactedChars: 0,
+            receipts: 0,
+            receiptChars: 0,
+            budgetEvicted: 0,
+            budgetChars: 0,
+            budgetOver: 0,
+            protectedReads: 0,
+            trimmed: 0,
+            errors: 0,
+          };
           const hidden = [];
 
           /* Work on copies so a frozen or reused event cannot turn a request into a failure. */
@@ -1099,24 +592,45 @@ export default {
               );
               if (!present) system.push({ type: "text", text });
             }
-            /* Measure before and after with the same counter: that delta is the exact number
-               of characters removed from the outgoing conversation, whichever trim path ran. */
-            toolResults = countToolResultParts(event.messages);
-            originalChars = messageCharCount(event.messages);
-            trimmed = trimToolResults(event.messages, contextConfig);
-            keptChars = messageCharCount(event.messages);
+            /* The engine measures the whole request before and after, then reports what
+               each pass removed. Conversation counts stay exact and independent of the
+               contract/brief and tool definitions the model also receives. */
+            const outcome = pruneContext(event, { rules: contextConfig, projectKey });
+            trimmed = outcome;
+            originalChars = conversationChars(outcome.before);
+            keptChars = conversationChars(outcome.after);
             savedChars = Math.max(0, originalChars - keptChars);
-            const reported = trimmed.old + trimmed.fresh + trimmed.collapsedChars;
+            toolResults = Number(outcome.before.toolResultParts) || 0;
+            measurement = outcome.after;
+            const reported =
+              trimmed.old +
+              trimmed.fresh +
+              trimmed.collapsedChars +
+              trimmed.supersededChars +
+              trimmed.staleChars +
+              trimmed.compactedChars +
+              trimmed.receiptChars +
+              trimmed.budgetChars;
             otherChars = Math.max(0, savedChars - reported);
             STATE.totals.originalChars += originalChars;
             STATE.totals.keptChars += keptChars;
             STATE.totals.oldChars += trimmed.old;
             STATE.totals.freshChars += trimmed.fresh;
             STATE.totals.collapsedChars += trimmed.collapsedChars;
+            STATE.totals.supersededChars += trimmed.supersededChars;
+            STATE.totals.staleChars += trimmed.staleChars;
+            STATE.totals.compactedChars += trimmed.compactedChars;
+            STATE.totals.receiptChars += trimmed.receiptChars;
+            STATE.totals.budgetChars += trimmed.budgetChars;
             STATE.totals.otherChars += otherChars;
             STATE.totals.toolResults += toolResults;
             STATE.totals.trimmedResults += trimmed.trimmed;
-            if (trimmed.collapsed > 0) STATE.totals.collapsed += trimmed.collapsed;
+            STATE.totals.collapsed += trimmed.collapsed;
+            STATE.totals.superseded += trimmed.superseded;
+            STATE.totals.stale += trimmed.stale;
+            STATE.totals.compacted += trimmed.compacted;
+            STATE.totals.receipts += trimmed.receipts;
+            STATE.totals.budgetEvicted += trimmed.budgetEvicted;
             if (savedChars > 0) {
               STATE.totals.prunes += 1;
               STATE.totals.prunedChars += savedChars;
@@ -1144,8 +658,24 @@ export default {
             oldChars: trimmed.old,
             freshChars: trimmed.fresh,
             otherChars,
+            superseded: trimmed.superseded,
+            merged: trimmed.merged,
+            supersededChars: trimmed.supersededChars,
+            stale: trimmed.stale,
+            staleChars: trimmed.staleChars,
+            compacted: trimmed.compacted,
+            compactedChars: trimmed.compactedChars,
+            receipts: trimmed.receipts,
+            receiptChars: trimmed.receiptChars,
+            budgetEvicted: trimmed.budgetEvicted,
+            budgetChars: trimmed.budgetChars,
+            budgetOver: trimmed.budgetOver,
+            pruneErrors: trimmed.errors,
             toolResults,
             trimmedResults: trimmed.trimmed,
+            requestChars: measurement ? measurement.chars : 0,
+            requestTokens: measurement ? measurement.estimatedTokens : 0,
+            measure: measurement,
             at: now,
           };
           /* The ledger is a pruning ledger: a request made while Context Keeper is off has no
@@ -1159,12 +689,22 @@ export default {
               session.oldChars = (session.oldChars || 0) + trimmed.old;
               session.freshChars = (session.freshChars || 0) + trimmed.fresh;
               session.collapsedChars = (session.collapsedChars || 0) + trimmed.collapsedChars;
+              session.supersededChars = (session.supersededChars || 0) + trimmed.supersededChars;
+              session.staleChars = (session.staleChars || 0) + trimmed.staleChars;
+              session.compactedChars = (session.compactedChars || 0) + trimmed.compactedChars;
+              session.receiptChars = (session.receiptChars || 0) + trimmed.receiptChars;
+              session.budgetChars = (session.budgetChars || 0) + trimmed.budgetChars;
               session.otherChars = (session.otherChars || 0) + otherChars;
               session.originalChars = (session.originalChars || 0) + originalChars;
               session.keptChars = (session.keptChars || 0) + keptChars;
               session.toolResults = (session.toolResults || 0) + toolResults;
               session.trimmedResults = (session.trimmedResults || 0) + trimmed.trimmed;
               session.collapsed = (session.collapsed || 0) + trimmed.collapsed;
+              session.superseded = (session.superseded || 0) + trimmed.superseded;
+              session.stale = (session.stale || 0) + trimmed.stale;
+              session.compacted = (session.compacted || 0) + trimmed.compacted;
+              session.receipts = (session.receipts || 0) + trimmed.receipts;
+              session.budgetEvicted = (session.budgetEvicted || 0) + trimmed.budgetEvicted;
               session.protectedReads = trimmed.protectedReads;
               session.lastSaved = savedChars;
               session.lastKept = keptChars;
@@ -1174,6 +714,17 @@ export default {
               session.lastOld = trimmed.old;
               session.lastFresh = trimmed.fresh;
               session.lastOther = otherChars;
+              session.lastSuperseded = trimmed.superseded;
+              session.lastSupersededChars = trimmed.supersededChars;
+              session.lastStale = trimmed.stale;
+              session.lastStaleChars = trimmed.staleChars;
+              session.lastCompacted = trimmed.compacted;
+              session.lastCompactedChars = trimmed.compactedChars;
+              session.lastReceipts = trimmed.receipts;
+              session.lastReceiptChars = trimmed.receiptChars;
+              session.lastBudgetEvicted = trimmed.budgetEvicted;
+              session.lastBudgetChars = trimmed.budgetChars;
+              session.lastMeasure = measurement;
               session.lastToolResults = toolResults;
               session.lastTrimmedResults = trimmed.trimmed;
               if (originalChars > 0) {

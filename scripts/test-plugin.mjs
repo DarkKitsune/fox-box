@@ -380,7 +380,11 @@ const jsonMessages = [
   },
 ];
 await hooks.context(contextEvent("ses_json", jsonMessages));
-assert.deepEqual(jsonMessages[1].content[0].result.value, jsonValue, "JSON result left intact");
+assert.equal(jsonMessages[1].content[0].result.type, "text", "oversized JSON becomes trimmed text");
+assert.ok(
+  jsonMessages[1].content[0].result.value.length <= 2000,
+  "a structured result obeys the fresh size cap instead of bypassing it",
+);
 
 const duplicateMessages = [
   {
@@ -565,7 +569,17 @@ assert.ok(status.last.hidden.includes("webfetch"), "hidden tool recorded");
 assert.equal(status.last.tools, 1, "visible tool count recorded");
 
 /* The ledger must report the exact measured delta, not a sum of guesses from each trim path. */
-assert.equal(status.version, 3, "metrics status schema version");
+assert.equal(status.version, 4, "metrics status schema version");
+assert.ok(status.last.measure, "whole-request measurement recorded");
+assert.ok(status.last.measure.system > 0, "system prompt measured");
+assert.ok(status.last.measure.toolDefinitions > 0, "tool definitions measured");
+assert.ok(status.last.requestChars >= status.last.keptChars, "whole request includes the conversation");
+assert.ok(status.sessions.ses_test.lastMeasure, "per-session whole-request measurement recorded");
+assert.equal(typeof status.last.superseded, "number", "superseded count recorded");
+assert.equal(typeof status.last.stale, "number", "stale count recorded");
+assert.equal(typeof status.last.compacted, "number", "compactor count recorded");
+assert.equal(typeof status.last.receipts, "number", "receipt count recorded");
+assert.equal(typeof status.last.budgetEvicted, "number", "budget eviction count recorded");
 assert.equal(
   status.last.savedChars,
   status.last.originalChars - status.last.keptChars,
@@ -573,7 +587,15 @@ assert.equal(
 );
 assert.equal(
   status.last.savedChars,
-  status.last.oldChars + status.last.freshChars + status.last.collapsedChars + status.last.otherChars,
+  status.last.oldChars +
+    status.last.freshChars +
+    status.last.collapsedChars +
+    status.last.supersededChars +
+    status.last.staleChars +
+    status.last.compactedChars +
+    status.last.receiptChars +
+    status.last.budgetChars +
+    status.last.otherChars,
   "last request breakdown adds up",
 );
 assert.ok(status.last.originalChars > status.last.keptChars, "last request context shrank");
@@ -600,7 +622,10 @@ assert.equal(
   JSON.stringify(jsonInput).length + JSON.stringify(jsonValue).length,
   "structured JSON tool results count toward the exact ledger",
 );
-assert.equal(status.sessions.ses_json.prunedChars, 0, "JSON results are counted, not rewritten");
+assert.ok(
+  status.sessions.ses_json.prunedChars > 0,
+  "an oversized structured result is trimmed like other fresh output",
+);
 assert.equal(
   status.sessions.ses_fresh.history[0].saved,
   status.sessions.ses_fresh.prunedChars,
@@ -645,6 +670,11 @@ assert.equal(
   status.sessions.ses_test.lastOld +
     status.sessions.ses_test.lastFresh +
     status.sessions.ses_test.lastCollapsedChars +
+    status.sessions.ses_test.lastSupersededChars +
+    status.sessions.ses_test.lastStaleChars +
+    status.sessions.ses_test.lastCompactedChars +
+    status.sessions.ses_test.lastReceiptChars +
+    status.sessions.ses_test.lastBudgetChars +
     status.sessions.ses_test.lastOther,
   status.sessions.ses_test.lastSaved,
   "latest-request breakdown adds up per session",
@@ -667,8 +697,18 @@ for (const key of [
   "oldChars",
   "freshChars",
   "collapsedChars",
+  "supersededChars",
+  "staleChars",
+  "compactedChars",
+  "receiptChars",
+  "budgetChars",
   "otherChars",
   "collapsed",
+  "superseded",
+  "stale",
+  "compacted",
+  "receipts",
+  "budgetEvicted",
   "toolResults",
   "trimmedResults",
 ]) {
@@ -1008,6 +1048,57 @@ await protectedPlugin.cleanup();
 const protectedStatus = JSON.parse(await fs.readFile(statusPath(protectedHome), "utf8"));
 assert.equal(protectedStatus.last.protectedReads, 1, "one latest read marked protected");
 assert.equal(protectedStatus.last.collapsed, 0, "protected-read test has no duplicates");
+
+/* Skill JSON and every file under a skills folder stay whole even when a compactor
+   or the global budget could have removed them. */
+const skillHome = await fs.mkdtemp(path.join(os.tmpdir(), "foxbox-skill-json-"));
+process.env.FOXBOX_HOME = skillHome;
+await fs.writeFile(
+  path.join(skillHome, "config.json"),
+  JSON.stringify({
+    ...config,
+    version: 2,
+    powers: {
+      ...config.powers,
+      context: {
+        ...config.powers.context,
+        keepRecent: 2,
+        protectedReads: 0,
+        collapseDuplicates: true,
+        trimToolOutput: true,
+        smartCompaction: true,
+        skeletonCodeReads: true,
+        budgetTokens: 500,
+        maxToolOutput: 2000,
+        maxOldToolOutput: 1000,
+      },
+    },
+  }),
+);
+const skillPlugin = await loadPlugin("skill-json");
+const skillPayload = JSON.stringify({
+  name: "fox-rules",
+  description: "Keep the fox canonical",
+  instructions: "s".repeat(6000),
+  allowed_tools: ["read", "grep"],
+});
+const skillMessages = [
+  {
+    role: "assistant",
+    content: [{ type: "tool-call", id: "skill-json", name: "read", input: { filePath: "skills/fox/rules.json" } }],
+  },
+  toolResult("skill-json", "read", skillPayload),
+  { role: "assistant", content: [{ type: "text", text: "Loaded." }] },
+  { role: "user", content: [{ type: "text", text: "Continue." }] },
+];
+await skillPlugin.hooks.context(contextEvent("ses_skill_json", skillMessages));
+assert.equal(skillMessages[1].content[0].result.value, skillPayload, "skill JSON is never compacted or size-capped");
+await skillPlugin.cleanup();
+const skillStatus = JSON.parse(await fs.readFile(statusPath(skillHome), "utf8"));
+assert.equal(skillStatus.last.compacted, 0, "no compactor touched skill JSON");
+assert.equal(skillStatus.last.budgetEvicted, 0, "budget did not evict the only skill JSON copy");
+assert.equal(skillStatus.last.oldChars + skillStatus.last.freshChars, 0, "size caps did not touch skill JSON");
+await fs.rm(skillHome, { recursive: true, force: true });
 
 /* Duplicate collapse still works when trimming is off. */
 const collapseHome = await fs.mkdtemp(path.join(os.tmpdir(), "foxbox-collapse-only-"));

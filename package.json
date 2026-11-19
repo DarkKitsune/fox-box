@@ -1,0 +1,93 @@
+{
+  "name": "fox-box",
+  "version": "1.1.1",
+  "private": true,
+  "type": "module",
+  "description": "Ten sharp little powers for context, build, prose and small-model tuning, plus a ledger for what pruning saved.",
+  "scripts": {
+    "build": "esbuild panel/main.ts --bundle --format=iife --platform=browser --target=chrome120 --outfile=panel/main.js",
+    "typecheck": "tsc --noEmit",
+    "test:plugin": "node scripts/test-plugin.mjs",
+    "check:manifest": "node scripts/check-manifest.mjs",
+    "check": "npm run typecheck && npm run test:plugin && npm run build && npm run check:manifest"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.7.0"
+    },
+    "id": "fox-box",
+    "name": "Fox Box",
+    "icon": "assets/fox.svg",
+    "contributes": {
+      "panel": {
+        "entry": "panel/index.html",
+        "mobile": true
+      },
+      "page": true,
+      "attach": "panel",
+      "actions": [
+        {
+          "id": "handoff",
+          "label": "Fox Box: build handoff",
+          "icon": "passport-line",
+          "where": "session",
+          "payload": [
+            "messages"
+          ]
+        },
+        {
+          "id": "red-pen-selection",
+          "label": "Fox Box: red-pen this",
+          "icon": "pen-nib-line",
+          "where": "selection",
+          "display": "both"
+        },
+        {
+          "id": "hunt-bug",
+          "label": "Fox Box: hunt this bug",
+          "icon": "bug-line",
+          "where": "selection",
+          "display": "both"
+        },
+        {
+          "id": "polish-prose",
+          "label": "Fox Box: polish prose",
+          "icon": "quill-pen-line",
+          "where": "selection",
+          "display": "both"
+        },
+        {
+          "id": "review-file",
+          "label": "Fox Box: review this file",
+          "icon": "file-search-line",
+          "where": "file"
+        },
+        {
+          "id": "red-pen-diff",
+          "label": "Fox Box: red-pen these lines",
+          "icon": "pen-nib-line",
+          "where": "diff"
+        }
+      ],
+      "filesystem": [
+        "~/.config/openchamber/fox-box/**"
+      ],
+      "opencodePlugin": "plugin",
+      "capabilities": [
+        "prompt",
+        "sessions",
+        "files",
+        "model"
+      ]
+    }
+  },
+  "dependencies": {
+    "@openchamber/sdk": "^2.7.2"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.3.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.0"
+  }
+}

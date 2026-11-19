@@ -1,0 +1,802 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fox Box panel harness</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #08080b;
+        color: #e9e9ef;
+        font-family: Inter, system-ui, sans-serif;
+        display: grid;
+        grid-template-columns: 440px minmax(0, 1fr);
+        gap: 16px;
+        padding: 16px;
+      }
+      iframe {
+        width: 440px;
+        height: 900px;
+        border: 1px solid #2b2b36;
+        border-radius: 12px;
+        background: #101014;
+      }
+      #side {
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      h1 { font-size: 16px; margin: 0; }
+      p { margin: 0; color: #8f8f9c; font-size: 12px; line-height: 1.5; }
+      #smoke {
+        font: 12px/1.5 ui-monospace, monospace;
+        color: #d8d8e4;
+        background: #141420;
+        border: 1px solid #303044;
+        border-radius: 8px;
+        padding: 8px;
+        min-height: 20px;
+      }
+      #smoke[data-state="pass"] { color: #8ff0bf; border-color: #2a5d43; }
+      #smoke[data-state="fail"] { color: #ffb4b4; border-color: #6b2a34; }
+      body.mobile {
+        display: block;
+        width: 390px;
+        max-width: 100%;
+        padding: 0;
+        background: #08080b;
+      }
+      body.mobile iframe {
+        width: 360px;
+        max-width: 100%;
+        height: 100vh;
+        border: 0;
+        border-radius: 0;
+      }
+      body.mobile #side { display: none; }
+      #errors {
+        white-space: pre-wrap;
+        font: 11px/1.5 ui-monospace, monospace;
+        color: #ffb4b4;
+        background: #2a1013;
+        border: 1px solid #592127;
+        border-radius: 8px;
+        padding: 8px;
+        max-height: 280px;
+        overflow: auto;
+      }
+      #errors:empty { display: none; }
+      #log {
+        white-space: pre-wrap;
+        font: 11px/1.5 ui-monospace, monospace;
+        color: #b9b9c6;
+        background: #111117;
+        border: 1px solid #272732;
+        border-radius: 8px;
+        padding: 8px;
+        max-height: 560px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="frame" src="/panel/index.html"></iframe>
+    <div id="side">
+      <h1>Fox Box panel harness</h1>
+      <p>Mock host only. No OpenChamber state is touched. Errors and host calls appear below.</p>
+      <div id="smoke" data-state="pending">smoke: waiting for panel</div>
+      <div id="errors"></div>
+      <div id="log"></div>
+    </div>
+    <script>
+      const CHANNEL = "openchamber.sdk";
+      const VERSION = 1;
+      const mobile = new URLSearchParams(location.search).has("mobile");
+      if (mobile) document.body.classList.add("mobile");
+      const frame = document.getElementById("frame");
+      const logEl = document.getElementById("log");
+      const errorEl = document.getElementById("errors");
+      const log = (line) => {
+        logEl.textContent += line + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+      const fail = (line) => {
+        errorEl.textContent += line + "\n";
+        errorEl.scrollTop = errorEl.scrollHeight;
+      };
+
+      const storage = new Map();
+      const files = new Map();
+      let nextSession = 2;
+      let generated = 0;
+      let sessionSubId = null;
+
+      const config = {
+        version: 2,
+        powers: {
+          context: {
+            enabled: true,
+            protectSkills: true,
+            keepRecent: 8,
+            protectedReads: 6,
+            collapseDuplicates: true,
+            trimToolOutput: true,
+            maxToolOutput: 48000,
+            maxOldToolOutput: 6000,
+            protectPaths: "src/core/**",
+            briefs: { "c:/demo": "Keep the fox canonical and the core loop small." },
+          },
+          model: {
+            enabled: true,
+            preset: "qwen-thinking",
+            applyToQwenOnly: true,
+            temperature: 1.0,
+            topP: 0.95,
+            topK: 20,
+            presencePenalty: 0,
+            frequencyPenalty: 0,
+            maxOutputTokens: 8192,
+            capOutput: true,
+            reasoningEffort: "xhigh",
+            contractEnabled: true,
+            contract: "CONTRACT: work in small verified steps.",
+            hideTools: ["task"],
+          },
+        },
+      };
+
+      const statusNow = Date.now();
+      const status = {
+        version: 3,
+        stopped: false,
+        loadedAt: statusNow - 60000,
+        updatedAt: statusNow - 1200,
+        totals: {
+          context: 8,
+          toolTrims: 2,
+          prunes: 3,
+          prunedChars: 184000,
+          model: 7,
+          collapsed: 5,
+          collapsedChars: 52000,
+          originalChars: 620000,
+          keptChars: 436000,
+          oldChars: 96000,
+          freshChars: 36000,
+          otherChars: 0,
+          toolResults: 41,
+          trimmedResults: 9,
+        },
+        sessions: {
+          s1: {
+            lastAt: statusNow - 1200,
+            runs: 3,
+            prunedChars: 84000,
+            model: "strata/unsloth-ud-iq4_xs-v31",
+            collapsed: 2,
+            collapsedChars: 32000,
+            oldChars: 46000,
+            freshChars: 6000,
+            otherChars: 0,
+            originalChars: 322000,
+            keptChars: 238000,
+            toolResults: 18,
+            trimmedResults: 5,
+            protectedReads: 2,
+            lastSaved: 64000,
+            lastKept: 158000,
+            lastOriginal: 222000,
+            history: [
+              { at: statusNow - 300000, saved: 8000, kept: 38000 },
+              { at: statusNow - 200000, saved: 12000, kept: 42000 },
+              { at: statusNow - 1200, saved: 64000, kept: 158000 },
+            ],
+          },
+        },
+        last: {
+          sessionId: "s1",
+          model: "strata/unsloth-ud-iq4_xs-v31",
+          tools: 14,
+          hidden: ["task"],
+          applied: true,
+          freshCap: 48000,
+          oldCap: 6000,
+          trimToolOutput: true,
+          protectedReads: 2,
+          collapsed: 2,
+          collapsedChars: 32000,
+          originalChars: 222000,
+          keptChars: 158000,
+          savedChars: 64000,
+          savedPercent: 28.8,
+          oldChars: 46000,
+          freshChars: 6000,
+          otherChars: 0,
+          toolResults: 18,
+          trimmedResults: 5,
+          at: statusNow - 1200,
+        },
+      };
+
+      files.set("~/.config/openchamber/fox-box/config.json", JSON.stringify(config, null, 2));
+      /* The panel computes this name from ready.directory; keep the hash identical here so the
+         harness exercises the real per-project status path. No legacy status.json is written. */
+      const demoDirectory = "C:\\Demo";
+      const statusFileKey = (directory) => {
+        const key = String(directory || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() || "global";
+        let hash = 2166136261;
+        for (let index = 0; index < key.length; index += 1) {
+          hash ^= key.charCodeAt(index);
+          hash = Math.imul(hash, 16777619);
+        }
+        return `status-${(hash >>> 0).toString(36)}.json`;
+      };
+      files.set(
+        `~/.config/openchamber/fox-box/${statusFileKey(demoDirectory)}`,
+        JSON.stringify(status, null, 2),
+      );
+      const brokenConfig = new URLSearchParams(location.search).has("broken-config");
+      const BROKEN_CONFIG_TEXT = "{ this is not json";
+      if (brokenConfig) files.set("~/.config/openchamber/fox-box/config.json", BROKEN_CONFIG_TEXT);
+      files.set(
+        "package.json",
+        JSON.stringify(
+          {
+            name: "demo-game",
+            scripts: { dev: "vite", test: "vitest run", build: "vite build" },
+            dependencies: { three: "^0.190.0", typescript: "^5.9.0" },
+          },
+          null,
+          2,
+        ),
+      );
+      files.set("Cargo.toml", '[package]\nname = "demo-game"\n\n[dependencies]\nbevy = "0.18"\nserde = { version = "1" }\n');
+      files.set("README.md", "# Demo Game\nA small game about a fox with a box of powers.");
+      files.set("src/core/demo.ts", "export function makeBox(n: number) {\n  return Array.from({ length: n }, (_, i) => i);\n}\n");
+
+      const sessions = [
+        {
+          id: "s1",
+          title: "Design the Fox Box panel",
+          projectId: "p1",
+          directory: "C:\\Demo",
+          parentId: null,
+          createdAt: Date.now() - 600000,
+          updatedAt: Date.now() - 1000,
+          archivedAt: null,
+          worktree: null,
+          activity: "idle",
+          outcome: "completed",
+          items: [],
+          inWork: true,
+          context: { tokens: 42100, limit: 262144 },
+        },
+      ];
+
+      const projects = [{ id: "p1", name: "Demo", directory: "C:\\Demo" }];
+      const ready = {
+        theme: {
+          mode: "dark",
+          tokens: {
+            background: "#0b0b0f",
+            elevated: "#15151b",
+            foreground: "#ececf1",
+            muted: "#8d8d9b",
+            subtle: "#24242e",
+            border: "#2b2b36",
+            hover: "#20202a",
+            selection: "#33334a",
+            focus: "#a274ff",
+            primary: "#8e4ec6",
+            mutedSurface: "#111116",
+            elevatedForeground: "#ececf1",
+            active: "#30303a",
+            selectionForeground: "#ffffff",
+            primaryForeground: "#ffffff",
+            primaryText: "#c9a8ff",
+            successText: "#5fd39b",
+            warningText: "#ffc46b",
+            errorText: "#ff7a86",
+            infoText: "#83b7ff",
+            success: "#30a46c",
+            warning: "#ffb224",
+            error: "#e5484d",
+            info: "#3b82f6",
+            font: "Inter, system-ui, sans-serif",
+            mono: "ui-monospace, SFMono-Regular, Consolas, monospace",
+            radius: "9px",
+          },
+        },
+        locale: "en",
+        directory: "C:\\Demo",
+        session: {
+          id: "s1",
+          title: "Design the Fox Box panel",
+          busy: false,
+          model: "strata/unsloth-ud-iq4_xs-v31",
+          agent: "build",
+        },
+        surface: "panel",
+        connection: { connected: false, account: "" },
+        settings: {},
+        item: null,
+        features: { lateGenerateResults: true, popovers: true },
+        device: mobile
+          ? {
+              formFactor: "phone",
+              pointer: "coarse",
+              insets: { top: 8, right: 0, bottom: 12, left: 0 },
+              keyboard: 0,
+            }
+          : {
+              formFactor: "desktop",
+              pointer: "fine",
+              insets: { top: 0, right: 0, bottom: 0, left: 0 },
+              keyboard: 0,
+            },
+      };
+
+      const post = (message) => {
+        if (!frame.contentWindow) return;
+        frame.contentWindow.postMessage(message, "*");
+      };
+
+      const reply = (id, payload) => post({ channel: CHANNEL, v: VERSION, type: "result", id, ok: true, payload });
+      const reject = (id, code, error) => post({ channel: CHANNEL, v: VERSION, type: "result", id, ok: false, code, error });
+
+      const workspace = (query) => {
+        if (query.kind === "projects") {
+          return { kind: "projects", state: "ready", projects };
+        }
+        if (query.kind === "sessions") {
+          return {
+            kind: "sessions",
+            projectId: query.projectId,
+            state: "ready",
+            coverage: [{ directory: "C:\\Demo", state: "ready" }],
+            sessions,
+          };
+        }
+        return { kind: "worktrees", projectId: query.projectId, state: "ready", worktrees: [] };
+      };
+
+      const generatedText = (prompt) => {
+        generated += 1;
+        if (/handoff/i.test(prompt)) {
+          return "# Handoff\n## Goal\nShip the Fox Box panel.\n## Current state\nPanel is mounted and the mock host answers.\n## Decisions\nKeep the plugin tool-free.\n## Files and commands\npanel/main.ts, plugin/index.js; npm run check.\n## Open threads\nVisual pass on narrow width.\n## Next three moves\n1. Fix runtime errors.\n2. Check mobile wrap.\n3. Rebuild the bundle.\n## Do not\nDo not add duplicate tools.";
+        }
+        if (/Slice/i.test(prompt) || /## Steps/i.test(prompt)) {
+          return "# Slice\n## Outcome\nA working first pass.\n## Non-goals\nNo new dependencies.\n## Steps\n1. Mount the shell. Verify `npm run build`.\n2. Add context controls. Verify `npm run typecheck`.\n## Acceptance checks\n- Panel mounts.\n- Save writes config.\n## Risks\nMock host may differ from the real one.\n## First prompt\nStart with step 1.";
+        }
+        if (/game|juice|feel/i.test(prompt)) {
+          return "# Juice pass\n## Feel target\nCrunchy.\n## Feedback table\n| Event | Motion | Particles | Sound | Camera | Timing |\n| Hit | squash 0.85 | 8 sparks | thock | 2px shake | 90ms |\n## Implementation notes\nUse hitstop 60ms.\n## Playtest checks\nDoes the hit read without sound?";
+        }
+        return `# Mock result ${generated}\nThis is generated text from the harness.\n\n## Notes\n- One\n- Two`;
+      };
+
+      frame.addEventListener("load", () => {
+        try {
+          frame.contentWindow.addEventListener("error", (event) => {
+            fail(`${event.message} (${event.filename}:${event.lineno})`);
+          });
+          frame.contentWindow.addEventListener("unhandledrejection", (event) => {
+            fail(`Unhandled rejection: ${event.reason && event.reason.message ? event.reason.message : event.reason}`);
+          });
+          const originalError = frame.contentWindow.console.error;
+          frame.contentWindow.console.error = (...args) => {
+            fail(args.map((value) => (value && value.stack ? value.stack : String(value))).join(" "));
+            originalError.apply(frame.contentWindow.console, args);
+          };
+        } catch (error) {
+          fail(`Could not attach frame diagnostics: ${error}`);
+        }
+      });
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== frame.contentWindow) return;
+        const message = event.data;
+        if (!message || message.channel !== CHANNEL) return;
+        const { type, id, payload } = message;
+        try {
+          switch (type) {
+            case "hello":
+              post({ channel: CHANNEL, v: VERSION, type: "ready", payload: ready });
+              break;
+            case "workspace-read":
+              reply(id, workspace(payload));
+              break;
+            case "workspace-subscribe": {
+              const subscriptionId = payload.subscriptionId;
+              reply(id, {});
+              if (payload.query.kind === "sessions") {
+                sessionSubId = subscriptionId;
+                post({
+                  channel: CHANNEL,
+                  v: VERSION,
+                  type: "workspace",
+                  payload: { subscriptionId, snapshot: workspace(payload.query) },
+                });
+              }
+              break;
+            }
+            case "storage": {
+              if (payload.op === "get") {
+                if (storage.has(payload.key)) {
+                  reply(id, { storage: true, op: "get", found: true, value: storage.get(payload.key) });
+                } else {
+                  reply(id, { storage: true, op: "get", found: false });
+                }
+              } else if (payload.op === "set") {
+                storage.set(payload.key, payload.value);
+                reply(id, { storage: true, op: "set" });
+              } else if (payload.op === "delete") {
+                storage.delete(payload.key);
+                reply(id, { storage: true, op: "delete" });
+              } else if (payload.op === "keys") {
+                reply(id, { storage: true, op: "keys", keys: Array.from(storage.keys()) });
+              } else {
+                reject(id, "HOST_REJECTED", "unknown storage op");
+              }
+              break;
+            }
+            case "file-read":
+              if (files.has(payload.path)) {
+                reply(id, { content: files.get(payload.path) });
+              } else {
+                reject(id, "NOT_FOUND", `No mock file: ${payload.path}`);
+              }
+              break;
+            case "file-write":
+              files.set(payload.path, payload.content);
+              log(`write ${payload.path} (${payload.content.length} chars)`);
+              reply(id, { written: true });
+              break;
+            case "file-list":
+              reply(id, {
+                entries: [
+                  { name: "package.json", kind: "file" },
+                  { name: "Cargo.toml", kind: "file" },
+                  { name: "README.md", kind: "file" },
+                  { name: "src", kind: "directory" },
+                ],
+              });
+              break;
+            case "file-stat":
+              reply(id, files.has(payload.path)
+                ? { kind: "file", size: files.get(payload.path).length, mtime: Date.now() }
+                : { kind: "missing", size: 0, mtime: 0 });
+              break;
+            case "generate":
+              log(`generate ${payload.prompt.length} chars`);
+              setTimeout(() => reply(id, { text: generatedText(payload.prompt) }), 80);
+              break;
+            case "prompt":
+              log(`prompt ${payload.text.length} chars`);
+              reply(id, { sent: "sent" });
+              break;
+            case "compose":
+              log(`compose ${payload.text.length} chars`);
+              reply(id, {});
+              break;
+            case "attach":
+              log(`attach ${payload.title || payload.id}`);
+              reply(id, {});
+              break;
+            case "start-session":
+              log(`start-session ${payload.title || ""}`);
+              nextSession += 1;
+              reply(id, { sessionId: `s${nextSession}`, sent: "sent", directory: "C:\\Demo" });
+              break;
+            case "toast":
+              log(`toast ${payload.kind}: ${payload.message}`);
+              reply(id, {});
+              break;
+            case "clipboard-write":
+              log(`clipboard ${payload.text.length} chars`);
+              reply(id, {});
+              break;
+            case "open-url":
+              log(`open-url ${payload.url}`);
+              reply(id, {});
+              break;
+            case "badge":
+            case "resize":
+            case "open-surface":
+            case "open-session":
+            case "session-link":
+            case "close":
+            case "oauth-start":
+            case "oauth-disconnect":
+              reply(id, {});
+              break;
+            case "generate-late-listen":
+            case "workspace-unsubscribe":
+              break;
+            default:
+              log(`unhandled ${type}`);
+              reply(id, {});
+          }
+        } catch (error) {
+          reject(id, "HOST_REJECTED", String(error));
+          fail(`Host handler ${type}: ${error}`);
+        }
+      });
+
+      // Re-send the session snapshot after the panel has had time to subscribe.
+      setTimeout(() => {
+        if (!sessionSubId) return;
+        post({
+          channel: CHANNEL,
+          v: VERSION,
+          type: "workspace",
+          payload: { subscriptionId: sessionSubId, snapshot: workspace({ kind: "sessions", projectId: "p1" }) },
+        });
+      }, 1200);
+
+      const smokeEl = document.getElementById("smoke");
+      const setSmoke = (state, text) => {
+        smokeEl.dataset.state = state;
+        smokeEl.textContent = text;
+      };
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const doc = () => frame.contentDocument;
+      const waitFor = async (check, label, timeout = 4000) => {
+        const started = Date.now();
+        while (Date.now() - started < timeout) {
+          try {
+            if (check()) return;
+          } catch {}
+          await sleep(50);
+        }
+        throw new Error(`timeout waiting for ${label}`);
+      };
+      const buttonWith = (text, selector = "button") => {
+        const nodes = Array.from(doc().querySelectorAll(selector));
+        return nodes.find((node) => (node.textContent || "").includes(text)) || null;
+      };
+      const clickText = async (text, selector = "button", label = text) => {
+        await waitFor(() => buttonWith(text, selector), label);
+        buttonWith(text, selector).click();
+      };
+      const fieldByLabel = (labelText) => {
+        const labels = Array.from(doc().querySelectorAll("label.oc-sdk-field"));
+        return labels.find(
+          (label) => (label.querySelector(".oc-sdk-field-label")?.textContent || "").trim() === labelText,
+        )?.querySelector("input, textarea") || null;
+      };
+      const setField = (labelText, value) => {
+        const input = fieldByLabel(labelText);
+        if (!input) throw new Error(`field not found: ${labelText}`);
+        input.value = value;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      };
+      const bodyText = () => doc()?.body?.textContent || "";
+      const resultHas = (text) =>
+        Array.from(doc()?.querySelectorAll(".fb-result") || []).some((node) => (node.textContent || "").includes(text));
+
+      const smoke = async () => {
+        try {
+          setSmoke("running", "smoke: running");
+          await waitFor(() => doc()?.querySelector(".fb-shell"), "panel mount");
+          if (!bodyText().includes("Fox Box")) throw new Error("title missing");
+          if (!bodyText().includes("Context window")) throw new Error("session strip missing");
+          await waitFor(() => bodyText().includes("42.1k / 262.1k tokens"), "context meter");
+          await waitFor(() => bodyText().includes("84.0k chars"), "session pruned stat");
+
+          await clickText("Metrics", '[role="tab"]', "Metrics tab");
+          await clickText("Pruning Ledger");
+          await waitFor(() => bodyText().includes("Pruned this session"), "Pruning Ledger body");
+          if (!bodyText().includes("Savings rate")) throw new Error("savings rate missing");
+          if (!bodyText().includes("Where it went")) throw new Error("breakdown missing");
+          if (!bodyText().includes("84,000 chars")) throw new Error("exact session pruned total missing");
+          if (!bodyText().includes("26%")) throw new Error("session savings rate wrong or missing");
+          if (!bodyText().includes("29% pruned")) throw new Error("last-request share missing");
+          if (!bodyText().includes("46,000")) throw new Error("aged-result breakdown missing");
+          if (!bodyText().includes("6,000")) throw new Error("fresh-result breakdown missing");
+          if (!bodyText().includes("32,000")) throw new Error("duplicate breakdown missing");
+          if (!bodyText().includes("64,000 chars pruned") || !bodyText().includes("158,000 chars kept")) {
+            throw new Error("last-request legend missing");
+          }
+          if (!bodyText().includes("Trimmed 5 of 18 tool results")) throw new Error("tool-result count missing");
+          if (!bodyText().includes("184.0k chars pruned")) throw new Error("all-session total missing");
+          if (!bodyText().includes("this chat")) throw new Error("session table row missing");
+          const share = doc()?.querySelector(".fb-share-pruned");
+          if (!share || !share.style || !share.style.width) throw new Error("share bar missing");
+          const shareWidth = Number.parseFloat(share.style.width);
+          if (!(shareWidth > 28 && shareWidth < 30)) throw new Error(`share bar width wrong: ${share.style.width}`);
+          if (doc()?.querySelectorAll(".fb-bar").length !== 3) throw new Error("history bars missing");
+          await clickText("Copy ledger");
+          await waitFor(() => logEl.textContent.includes("clipboard"), "ledger copy");
+          await clickText("Refresh ledger");
+          await clickText("Ask what to trim");
+          await waitFor(() => logEl.textContent.includes("prompt "), "ledger agent prompt");
+
+          await clickText("Build", '[role="tab"]', "Build tab");
+          await sleep(120);
+          await waitFor(() => bodyText().includes("Slice Forge"), "Build tab content");
+          await clickText("Slice Forge");
+          await waitFor(() => bodyText().includes("What are we building?"), "Slice Forge body");
+          setField("What are we building?", "A tiny vertical slice for the panel harness.");
+          setField("Constraints", "No new dependencies.");
+          await clickText("Forge slice");
+          await waitFor(() => resultHas("# Slice"), "Slice Forge result");
+
+          await clickText("Studio", '[role="tab"]', "Studio tab");
+          await sleep(120);
+          await waitFor(() => bodyText().includes("Character Forge"), "Studio tab content");
+          await clickText("Character Forge");
+          await waitFor(() => fieldByLabel("Name"), "Character Forge body");
+          setField("Name", "Vesper");
+          await clickText("Preview card");
+          await waitFor(() => resultHas("# Vesper"), "character preview");
+          await sleep(700);
+          const characterIndex = storage.get("characters:index");
+          if (!Array.isArray(characterIndex) || characterIndex.length === 0) {
+            throw new Error("character index was not saved");
+          }
+          const savedCharacter = storage.get(`character:${characterIndex[0]}`);
+          if (!savedCharacter || savedCharacter.name !== "Vesper") {
+            throw new Error("character was not saved per item");
+          }
+
+          await clickText("Tune", '[role="tab"]', "Tune tab");
+          await clickText("Model Fit", "button", "Model Fit card");
+          await waitFor(() => bodyText().includes("Model Fit active"), "Model Fit");
+          if (!bodyText().includes("Qwen3.8 thinking")) throw new Error("Qwen preset missing");
+          const modelSwitch = buttonWith("Model Fit active", 'button[role="switch"]');
+          if (!modelSwitch) throw new Error("Model Fit switch missing");
+          modelSwitch.click();
+          await sleep(700);
+          if (modelSwitch.getAttribute("aria-checked") !== "false") {
+            throw new Error("switch did not repaint after it was turned off");
+          }
+          const configRaw = files.get("~/.config/openchamber/fox-box/config.json");
+          if (!configRaw) throw new Error("config file was not written");
+          const savedConfig = JSON.parse(configRaw);
+          if (savedConfig.powers.model.enabled !== false) {
+            throw new Error("Model Fit switch did not reach the config file");
+          }
+          modelSwitch.click();
+          await sleep(700);
+          if (modelSwitch.getAttribute("aria-checked") !== "true") {
+            throw new Error("switch did not repaint after it was turned back on");
+          }
+          if (JSON.parse(files.get("~/.config/openchamber/fox-box/config.json")).powers.model.enabled !== true) {
+            throw new Error("second switch click did not reach the config file");
+          }
+
+          await clickText("Build", '[role="tab"]', "Build tab");
+          await clickText("Red Pen");
+          await waitFor(() => fieldByLabel("Code or diff"), "Red Pen body");
+          setField("Code or diff", "function add(a, b) { return a - b; }");
+          await clickText("Quick scan");
+          await waitFor(() => resultHas("Mock result"), "Red Pen result");
+
+          await clickText("Game Feel Lab");
+          await waitFor(() => bodyText().includes("Design the pass"), "Game Feel body");
+          await clickText("Design the pass");
+          await waitFor(() => resultHas("# Juice pass"), "Game Feel result");
+
+          await clickText("Context", '[role="tab"]', "Context tab");
+          await clickText("Handoff Passport");
+          await waitFor(() => fieldByLabel("Notes to carry"), "Handoff body");
+          setField("Notes to carry", "Keep the panel clean and the plugin tool-free.");
+          await clickText("Distill passport");
+          await waitFor(() => resultHas("# Handoff"), "Handoff result");
+
+          await clickText("Context Keeper");
+          await waitFor(() => fieldByLabel("Pinned paths"), "Context Keeper body");
+          setField("Pinned paths", "src/core/**\ndocs/*.md");
+          await sleep(600);
+          const pinnedConfig = JSON.parse(files.get("~/.config/openchamber/fox-box/config.json"));
+          if (pinnedConfig.powers.context.protectPaths !== "src/core/**\ndocs/*.md") {
+            throw new Error("pinned paths did not reach the config file");
+          }
+          await clickText("6 files", 'button', "latest reads trigger");
+          await clickText("12 files", 'button[role="option"]', "latest reads option");
+          await sleep(600);
+          if (!buttonWith("12 files")) throw new Error("latest reads select did not repaint");
+          if (JSON.parse(files.get("~/.config/openchamber/fox-box/config.json")).powers.context.protectedReads !== 12) {
+            throw new Error("latest reads select did not reach the config file");
+          }
+          await clickText("48k chars", 'button', "fresh cap trigger");
+          await clickText("64k chars", 'button[role="option"]', "fresh cap option");
+          await sleep(600);
+          if (!buttonWith("64k chars")) throw new Error("select did not repaint after choosing a value");
+          const capConfig = JSON.parse(files.get("~/.config/openchamber/fox-box/config.json"));
+          if (capConfig.powers.context.maxToolOutput !== 64000) {
+            throw new Error("fresh cap select did not reach the config file");
+          }
+
+          await clickText("Studio", '[role="tab"]', "Studio tab");
+          await sleep(120);
+          await clickText("Prose Atelier");
+          await waitFor(() => fieldByLabel("Prose or scene"), "Prose Atelier body");
+          setField("Prose or scene", "The fox crossed the dark yard, quiet as a rumor.");
+          await clickText("Polish");
+          await waitFor(() => resultHas("Mock result"), "Prose result");
+
+          await clickText("Idea Distiller");
+          await waitFor(() => fieldByLabel("Title"), "Idea Distiller body");
+          setField("Title", "Test spark one");
+          setField("Note", "A tiny idea about a box.");
+          await clickText("Add spark");
+          setField("Title", "Test spark two");
+          setField("Note", "Another tiny idea about a fox.");
+          await clickText("Add spark");
+          await waitFor(() => bodyText().includes("Test spark one") && bodyText().includes("Test spark two"), "spark rows");
+          const sparkBoxes = Array.from(doc().querySelectorAll(".fb-spark input[type=checkbox]"));
+          if (sparkBoxes.length < 2) throw new Error("spark checkboxes missing");
+          sparkBoxes[0].click();
+          await sleep(60);
+          Array.from(doc().querySelectorAll(".fb-spark input[type=checkbox]"))[1]?.click();
+          await clickText("Blend two");
+          await waitFor(() => resultHas("Mock result"), "Idea blend result");
+          await sleep(700);
+          const sparkIndex = storage.get("sparks:index");
+          if (!Array.isArray(sparkIndex) || sparkIndex.length < 2) {
+            throw new Error("spark index was not saved per item");
+          }
+
+          await clickText("Context", '[role="tab"]', "Context tab");
+          await clickText("Context Keeper");
+          await waitFor(() => buttonWith("Reload rules"), "Reload rules button");
+          await clickText("Reload rules");
+          await sleep(700);
+          if (!doc()?.querySelector(".fb-shell")) throw new Error("panel did not survive a rules reload");
+
+          setSmoke("pass", `smoke: pass — ${logEl.textContent.trim().split("\n").length} host calls`);
+        } catch (error) {
+          setSmoke("fail", `smoke: fail — ${error.message}`);
+          fail(`Smoke failure: ${error.stack || error.message}`);
+        }
+      };
+
+      const brokenSmoke = async () => {
+        try {
+          setSmoke("running", "broken-config smoke: running");
+          await waitFor(() => doc()?.querySelector(".fb-shell"), "panel mount");
+          await waitFor(() => bodyText().includes("Rules are not saved"), "unreadable config warning");
+          await clickText("Tune", '[role="tab"]', "Tune tab");
+          await clickText("Model Fit", "button", "Model Fit card");
+          await waitFor(() => buttonWith("Model Fit active", 'button[role="switch"]'), "Model Fit switch");
+          buttonWith("Model Fit active", 'button[role="switch"]')?.click();
+          await sleep(700);
+          const raw = files.get("~/.config/openchamber/fox-box/config.json");
+          if (raw !== BROKEN_CONFIG_TEXT) {
+            throw new Error("panel overwrote an unreadable config file");
+          }
+          setSmoke("pass", "broken-config smoke: pass — unreadable config preserved");
+        } catch (error) {
+          setSmoke("fail", `broken-config smoke: fail — ${error.message}`);
+          fail(`Broken-config failure: ${error.stack || error.message}`);
+        }
+      };
+
+      if (!mobile) {
+        frame.addEventListener("load", () => {
+          setTimeout(() => void (brokenConfig ? brokenSmoke() : smoke()), 700);
+        });
+      } else {
+        frame.addEventListener("load", () => {
+          setTimeout(() => {
+            try {
+              const inner = frame.contentWindow;
+              const panel = frame.contentDocument;
+              setSmoke(
+                "pass",
+                `mobile iframe=${frame.clientWidth} inner=${inner.innerWidth} mq=${inner.matchMedia("(max-width: 430px)").matches} scroll=${panel.documentElement.scrollWidth}/${panel.documentElement.clientWidth}`,
+              );
+            } catch (error) {
+              setSmoke("fail", `mobile probe failed: ${error}`);
+            }
+          }, 900);
+        });
+      }
+    </script>
+  </body>
+</html>

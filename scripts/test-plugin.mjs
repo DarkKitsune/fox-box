@@ -25,7 +25,7 @@ function statusPath(home) {
 }
 
 const config = {
-  version: 2,
+  version: 3,
   powers: {
     context: {
       enabled: true,
@@ -747,7 +747,7 @@ await fs.writeFile(
   path.join(rereadHome, "config.json"),
   JSON.stringify({
     ...config,
-    version: 2,
+    version: 3,
     powers: {
       ...config.powers,
       context: {
@@ -894,7 +894,7 @@ assert.equal(
 );
 await fs.rm(isolationHome, { recursive: true, force: true });
 
-/* A version 1 config with a sub-48k cap must migrate to 48k, not stay aggressive. */
+/* A version 1 config with a sub-48k cap must migrate to the current 128k default, not stay aggressive. */
 const legacyHome = await fs.mkdtemp(path.join(os.tmpdir(), "foxbox-legacy-"));
 process.env.FOXBOX_HOME = legacyHome;
 await fs.writeFile(
@@ -918,9 +918,91 @@ await legacy.hooks.context(legacyEvent);
 assert.equal(
   legacyEvent.messages[1].content[0].result.value.length,
   legacyFresh.length,
-  "v1 12k cap migrated to 48k",
+  "v1 12k cap migrated to 128k",
 );
 await legacy.cleanup();
+
+/* A version 2 config still on the old shipped defaults moves to the current ones:
+   128k fresh cap, 8 recent messages, trimming and code skeletons off, and the new contract. */
+const v2Home = await fs.mkdtemp(path.join(os.tmpdir(), "foxbox-v2-defaults-"));
+process.env.FOXBOX_HOME = v2Home;
+const LEGACY_V2_CONTRACT = [
+  "Fox Box small-model contract:",
+  "- Work in small, verifiable steps. Do not start a second step before the first has a visible result.",
+  "- Read only what the current step needs. Prefer one tool call at a time, and never repeat a call that already answered.",
+  "- Before claiming success, run the check that proves it. If you cannot run it, say what remains unverified.",
+  "- Keep chat replies short. Put exploration in tools, not in prose. Ask one precise question only when blocked.",
+].join("\n");
+await fs.writeFile(
+  path.join(v2Home, "config.json"),
+  JSON.stringify({
+    ...config,
+    version: 2,
+    powers: {
+      ...config.powers,
+      context: {
+        ...config.powers.context,
+        keepRecent: 10,
+        trimToolOutput: true,
+        maxToolOutput: 48000,
+        skeletonCodeReads: true,
+      },
+      model: { ...config.powers.model, contract: LEGACY_V2_CONTRACT },
+    },
+  }),
+);
+const v2 = await loadPlugin("v2-defaults");
+const v2Fresh = "v".repeat(60000);
+const v2FreshMessages = [
+  {
+    role: "assistant",
+    content: [{ type: "tool-call", id: "v2-fresh", name: "read", input: { filePath: "src/v2.ts" } }],
+  },
+  toolResult("v2-fresh", "read", v2Fresh),
+];
+await v2.hooks.context(contextEvent("ses_v2_fresh", v2FreshMessages));
+assert.equal(v2FreshMessages[1].content[0].result.value.length, v2Fresh.length, "v2 48k cap migrated to 128k");
+
+const skeletonRead = [
+  'import { fox } from "./fox";',
+  "export function alpha() {",
+  ...Array.from({ length: 120 }, (_, index) => `  return "alpha-${index}";`),
+  "}",
+  "export function beta() {",
+  ...Array.from({ length: 120 }, (_, index) => `  return "beta-${index}";`),
+  "}",
+  "export class Gamma {",
+  ...Array.from({ length: 120 }, (_, index) => `  gamma${index}() { return ${index}; }`),
+  "}",
+].join("\n");
+const v2SkeletonMessages = [
+  {
+    role: "assistant",
+    content: [{ type: "tool-call", id: "v2-skeleton", name: "read", input: { filePath: "src/skeleton.ts" } }],
+  },
+  toolResult("v2-skeleton", "read", skeletonRead),
+  ...Array.from({ length: 9 }, (_, index) => ({
+    role: "assistant",
+    content: [{ type: "text", text: `Still working ${index}.` }],
+  })),
+];
+const v2SkeletonEvent = {
+  ...contextEvent("ses_v2_skeleton", v2SkeletonMessages),
+  model: { providerID: "strata", id: "qwen3-8b" },
+};
+await v2.hooks.context(v2SkeletonEvent);
+assert.equal(
+  v2SkeletonMessages[1].content[0].result.value.length,
+  skeletonRead.length,
+  "v2 code skeletons default to off",
+);
+const v2System = v2SkeletonEvent.system.map((part) => part.text).join("\n");
+assert.match(v2System, /Prefer reading the code over guessing/, "v2 default contract upgraded");
+assert.doesNotMatch(v2System, /one tool call at a time/, "the opinionated contract line is gone");
+await v2.cleanup();
+const v2Status = JSON.parse(await fs.readFile(statusPath(v2Home), "utf8"));
+assert.equal(v2Status.last.trimToolOutput, false, "v2 trimming default migrated to off");
+await fs.rm(v2Home, { recursive: true, force: true });
 
 /* A cap above the old 64k ceiling must be honored. */
 const highHome = await fs.mkdtemp(path.join(os.tmpdir(), "foxbox-highcap-"));
@@ -929,7 +1011,7 @@ await fs.writeFile(
   path.join(highHome, "config.json"),
   JSON.stringify({
     ...config,
-    version: 2,
+    version: 3,
     powers: { ...config.powers, context: { ...config.powers.context, maxToolOutput: 128000 } },
   }),
 );
@@ -953,7 +1035,7 @@ await fs.writeFile(
   path.join(protectedHome, "config.json"),
   JSON.stringify({
     ...config,
-    version: 2,
+    version: 3,
     powers: {
       ...config.powers,
       context: {
@@ -1057,7 +1139,7 @@ await fs.writeFile(
   path.join(skillHome, "config.json"),
   JSON.stringify({
     ...config,
-    version: 2,
+    version: 3,
     powers: {
       ...config.powers,
       context: {
@@ -1107,7 +1189,7 @@ await fs.writeFile(
   path.join(collapseHome, "config.json"),
   JSON.stringify({
     ...config,
-    version: 2,
+    version: 3,
     powers: {
       ...config.powers,
       context: {
@@ -1158,7 +1240,7 @@ await fs.writeFile(
   path.join(hideHome, "config.json"),
   JSON.stringify({
     ...config,
-    version: 2,
+    version: 3,
     powers: {
       ...config.powers,
       model: {
@@ -1224,7 +1306,7 @@ await fs.writeFile(
   path.join(modelOffHome, "config.json"),
   JSON.stringify({
     ...config,
-    version: 2,
+    version: 3,
     powers: {
       ...config.powers,
       model: {
@@ -1267,7 +1349,7 @@ await fs.writeFile(
   path.join(repeatHome, "config.json"),
   JSON.stringify({
     ...config,
-    version: 2,
+    version: 3,
     powers: {
       ...config.powers,
       model: { ...config.powers.model, hideTools: [] },

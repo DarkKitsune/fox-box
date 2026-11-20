@@ -116,7 +116,7 @@
       let sessionSubId = null;
 
       const config = {
-        version: 2,
+        version: 3,
         powers: {
           context: {
             enabled: true,
@@ -124,8 +124,8 @@
             keepRecent: 8,
             protectedReads: 6,
             collapseDuplicates: true,
-            trimToolOutput: true,
-            maxToolOutput: 48000,
+            trimToolOutput: false,
+            maxToolOutput: 128000,
             maxOldToolOutput: 6000,
             protectPaths: "src/core/**",
             briefs: { "c:/demo": "Keep the fox canonical and the core loop small." },
@@ -713,7 +713,7 @@
           if (JSON.parse(files.get("~/.config/openchamber/fox-box/config.json")).powers.context.protectedReads !== 12) {
             throw new Error("latest reads select did not reach the config file");
           }
-          await clickText("48k chars", 'button', "fresh cap trigger");
+          await clickText("128k chars", 'button', "fresh cap trigger");
           await clickText("64k chars", 'button[role="option"]', "fresh cap option");
           await sleep(600);
           if (!buttonWith("64k chars")) throw new Error("select did not repaint after choosing a value");

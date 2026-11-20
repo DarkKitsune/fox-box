@@ -2797,7 +2797,7 @@ ${GUEST_UI_LOOK_CSS}`;
 
   // panel/main.ts
   var VERSION = "1.2.0";
-  var CONFIG_VERSION = 2;
+  var CONFIG_VERSION = 3;
   var CONFIG_PATH = "~/.config/openchamber/fox-box/config.json";
   var LEGACY_STATUS_PATH = "~/.config/openchamber/fox-box/status.json";
   var CHARACTER_INDEX_KEY = "characters:index";
@@ -2813,6 +2813,11 @@ ${GUEST_UI_LOOK_CSS}`;
   var NOTE_MAX = 2e3;
   var CONVERSATION_MAX = 26e3;
   var DEFAULT_CONTRACT = [
+    "Fox Box small-model contract:",
+    "- Prefer reading the code over guessing what it contains.",
+    "- Before claiming success, run the check that proves it. If you cannot run it, say what remains unverified."
+  ].join("\n");
+  var LEGACY_CONTRACT_V2 = [
     "Fox Box small-model contract:",
     "- Work in small, verifiable steps. Do not start a second step before the first has a visible result.",
     "- Read only what the current step needs. Prefer one tool call at a time, and never repeat a call that already answered.",
@@ -3187,11 +3192,11 @@ ${text.slice(-tail)}`;
         context: {
           enabled: true,
           protectSkills: true,
-          keepRecent: 10,
+          keepRecent: 8,
           protectedReads: 6,
           collapseDuplicates: true,
-          trimToolOutput: true,
-          maxToolOutput: 48e3,
+          trimToolOutput: false,
+          maxToolOutput: 128e3,
           maxOldToolOutput: 6e3,
           protectPaths: "",
           pathSupersession: true,
@@ -3200,7 +3205,7 @@ ${text.slice(-tail)}`;
           editReceipts: true,
           receiptMinChars: 1200,
           smartCompaction: true,
-          skeletonCodeReads: true,
+          skeletonCodeReads: false,
           budgetTokens: 0,
           charsPerToken: 4,
           relevanceScoring: true,
@@ -3255,17 +3260,21 @@ ${text.slice(-tail)}`;
       }
     }
     const legacyCap = context.maxToolOutput === null || context.maxToolOutput === void 0 ? Number.NaN : Number(context.maxToolOutput);
-    const freshCapIsLegacyDefault = inputVersion < CONFIG_VERSION && (!Number.isFinite(legacyCap) || legacyCap > 0 && legacyCap < 48e3);
+    const legacyKeepRecent = context.keepRecent === null || context.keepRecent === void 0 ? Number.NaN : Number(context.keepRecent);
+    const freshCapIsLegacyDefault = inputVersion < CONFIG_VERSION && (!Number.isFinite(legacyCap) || legacyCap === 48e3 || inputVersion < 2 && legacyCap > 0 && legacyCap < 48e3);
+    const keepRecentIsLegacyDefault = inputVersion < CONFIG_VERSION && (!Number.isFinite(legacyKeepRecent) || legacyKeepRecent === 10);
+    const contractIsLegacyDefault = inputVersion < CONFIG_VERSION && typeof model.contract === "string" && model.contract.trim() === LEGACY_CONTRACT_V2;
+    const trimIsLegacyDefault = inputVersion < CONFIG_VERSION;
     return {
       version: CONFIG_VERSION,
       powers: {
         context: {
           enabled: context.enabled !== false,
           protectSkills: context.protectSkills !== false,
-          keepRecent: clampInt(context.keepRecent ?? base.powers.context.keepRecent, 2, 40, base.powers.context.keepRecent),
+          keepRecent: keepRecentIsLegacyDefault ? base.powers.context.keepRecent : clampInt(context.keepRecent ?? base.powers.context.keepRecent, 2, 40, base.powers.context.keepRecent),
           protectedReads: clampInt(context.protectedReads ?? 6, 0, 12, base.powers.context.protectedReads),
           collapseDuplicates: context.collapseDuplicates !== false,
-          trimToolOutput: context.trimToolOutput !== false,
+          trimToolOutput: trimIsLegacyDefault ? false : context.trimToolOutput === true,
           maxToolOutput: freshCapIsLegacyDefault ? base.powers.context.maxToolOutput : clampInt(context.maxToolOutput ?? base.powers.context.maxToolOutput, 2e3, 256e3, base.powers.context.maxToolOutput),
           maxOldToolOutput: clampInt(
             context.maxOldToolOutput ?? base.powers.context.maxOldToolOutput,
@@ -3285,7 +3294,7 @@ ${text.slice(-tail)}`;
             base.powers.context.receiptMinChars
           ),
           smartCompaction: context.smartCompaction !== false,
-          skeletonCodeReads: context.skeletonCodeReads !== false,
+          skeletonCodeReads: trimIsLegacyDefault ? false : context.skeletonCodeReads === true,
           budgetTokens: clampInt(
             context.budgetTokens ?? base.powers.context.budgetTokens,
             0,
@@ -3334,7 +3343,7 @@ ${text.slice(-tail)}`;
           capOutput: model.capOutput !== false,
           reasoningEffort: typeof model.reasoningEffort === "string" ? model.reasoningEffort.slice(0, 16) : presetValues.reasoningEffort,
           contractEnabled: model.contractEnabled !== false,
-          contract: typeof model.contract === "string" && model.contract.trim() ? model.contract.slice(0, 3500) : DEFAULT_CONTRACT,
+          contract: contractIsLegacyDefault || typeof model.contract !== "string" || !model.contract.trim() ? DEFAULT_CONTRACT : model.contract.slice(0, 3500),
           hideTools: Array.from(new Set(hiddenTools)).slice(0, 24)
         }
       }
@@ -4168,10 +4177,14 @@ Return JSON only.`,
     addSelect(
       protectionGrid,
       "Keep recent messages",
-      [2, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40].map((value) => ({ id: String(value), label: String(value) })),
+      [2, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40].map((value) => ({
+        id: String(value),
+        label: String(value),
+        hint: value === 8 ? "default" : void 0
+      })),
       () => String(config.powers.context.keepRecent),
       (value) => {
-        config.powers.context.keepRecent = Number(value) || 10;
+        config.powers.context.keepRecent = Number(value) || 8;
       }
     );
     addSelect(
@@ -4214,7 +4227,7 @@ Return JSON only.`,
     addSwitch(
       pruning,
       "Trim tool output",
-      "Caps fresh results and shortens old ones in the outgoing request. The newest skill or pinned read stays whole; older duplicates may be collapsed.",
+      "Caps fresh results and shortens old ones in the outgoing request. Off by default because size caps can break context. The newest skill or pinned read stays whole; older duplicates may be collapsed.",
       () => config.powers.context.trimToolOutput,
       (value) => {
         config.powers.context.trimToolOutput = value;
@@ -4240,16 +4253,16 @@ Return JSON only.`,
         { id: "16000", label: "16k chars" },
         { id: "24000", label: "24k chars" },
         { id: "32000", label: "32k chars" },
-        { id: "48000", label: "48k chars", hint: "default" },
+        { id: "48000", label: "48k chars" },
         { id: "64000", label: "64k chars" },
         { id: "96000", label: "96k chars" },
-        { id: "128000", label: "128k chars" },
+        { id: "128000", label: "128k chars", hint: "default" },
         { id: "192000", label: "192k chars" },
         { id: "256000", label: "256k chars", hint: "almost never trim" }
       ],
       () => String(config.powers.context.maxToolOutput),
       (value) => {
-        config.powers.context.maxToolOutput = Number(value) || 48e3;
+        config.powers.context.maxToolOutput = Number(value) || 128e3;
       }
     );
     addSelect(
@@ -4320,7 +4333,7 @@ Return JSON only.`,
     addSwitch(
       advanced,
       "Code read skeletons",
-      "Old source reads keep imports, signatures, and top-level declarations while eliding function bodies. Only applied to large reads of known code files.",
+      "Old source reads keep imports, signatures, and top-level declarations while eliding function bodies. Only applied to large reads of known code files. Off by default because collapsing bodies can break context.",
       () => config.powers.context.skeletonCodeReads,
       (value) => {
         config.powers.context.skeletonCodeReads = value;

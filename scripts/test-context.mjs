@@ -1109,7 +1109,14 @@ function assertNoExpansion(outcome) {
   assert.equal(defaults.smartCompaction, true);
   assert.equal(defaults.budgetTokens, 0);
   assert.equal(defaults.charsPerToken, 4);
+  assert.equal(defaults.keepRecent, 8);
+  assert.equal(defaults.trimToolOutput, false);
+  assert.equal(defaults.maxToolOutput, 128000);
+  assert.equal(defaults.skeletonCodeReads, false);
   assert.equal(CONTEXT_RULE_DEFAULTS.pathSupersession, true);
+  assert.equal(CONTEXT_RULE_DEFAULTS.keepRecent, 8);
+  assert.equal(CONTEXT_RULE_DEFAULTS.trimToolOutput, false);
+  assert.equal(CONTEXT_RULE_DEFAULTS.skeletonCodeReads, false);
   const clamped = normalizeContextRules({
     keepRecent: 999,
     protectedReads: -4,

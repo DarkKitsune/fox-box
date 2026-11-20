@@ -11,7 +11,20 @@
 
 import { pruneContext } from "./context.js";
 
+/*
+ * Keep the injected contract free of style and workflow rules. Small models copy
+ * "one tool at a time", "keep replies short", and similar lines literally, which
+ * narrows their behavior beyond anything the task asked for. Only verification
+ * guidance stays.
+ */
 const DEFAULT_CONTRACT = [
+  "Fox Box small-model contract:",
+  "- Prefer reading the code over guessing what it contains.",
+  "- Before claiming success, run the check that proves it. If you cannot run it, say what remains unverified.",
+].join("\n");
+
+/* The version 2 contract, kept only so normalizeConfig can upgrade untouched copies. */
+const LEGACY_CONTRACT_V2 = [
   "Fox Box small-model contract:",
   "- Work in small, verifiable steps. Do not start a second step before the first has a visible result.",
   "- Read only what the current step needs. Prefer one tool call at a time, and never repeat a call that already answered.",
@@ -133,7 +146,7 @@ function isQwenModel(value) {
 }
 
 /* Bumped when a stored default changes; old configs are migrated in normalizeConfig. */
-const CONFIG_VERSION = 2;
+const CONFIG_VERSION = 3;
 
 function defaults() {
   return {
@@ -142,11 +155,11 @@ function defaults() {
       context: {
         enabled: true,
         protectSkills: true,
-        keepRecent: 10,
+        keepRecent: 8,
         protectedReads: 6,
         collapseDuplicates: true,
-        trimToolOutput: true,
-        maxToolOutput: 48000,
+        trimToolOutput: false,
+        maxToolOutput: 128000,
         maxOldToolOutput: 6000,
         protectPaths: "",
         pathSupersession: true,
@@ -155,7 +168,7 @@ function defaults() {
         editReceipts: true,
         receiptMinChars: 1200,
         smartCompaction: true,
-        skeletonCodeReads: true,
+        skeletonCodeReads: false,
         budgetTokens: 0,
         charsPerToken: 4,
         relevanceScoring: true,
@@ -213,22 +226,36 @@ function normalizeConfig(input) {
     }
   }
   /* Version 1 shipped a 16k default and options that stopped at 32k, which made small models
-     re-read files. Upgrade every sub-48k v1 cap once; the panel can still choose any value after. */
+     re-read files. Upgrade those caps once. Version 2 shipped 48k, 10 recent messages, trimming,
+     and code skeletons on; move untouched copies to the new defaults. A custom value survives. */
   const legacyCap = context.maxToolOutput === null || context.maxToolOutput === undefined
     ? Number.NaN
     : Number(context.maxToolOutput);
+  const legacyKeepRecent = context.keepRecent === null || context.keepRecent === undefined
+    ? Number.NaN
+    : Number(context.keepRecent);
   const freshCapIsLegacyDefault =
-    inputVersion < CONFIG_VERSION && (!Number.isFinite(legacyCap) || (legacyCap > 0 && legacyCap < 48000));
+    inputVersion < CONFIG_VERSION &&
+    (!Number.isFinite(legacyCap) ||
+      legacyCap === 48000 ||
+      (inputVersion < 2 && legacyCap > 0 && legacyCap < 48000));
+  const keepRecentIsLegacyDefault =
+    inputVersion < CONFIG_VERSION && (!Number.isFinite(legacyKeepRecent) || legacyKeepRecent === 10);
+  const contractIsLegacyDefault =
+    inputVersion < CONFIG_VERSION && typeof model.contract === "string" && model.contract.trim() === LEGACY_CONTRACT_V2;
+  const trimIsLegacyDefault = inputVersion < CONFIG_VERSION;
   return {
     version: CONFIG_VERSION,
     powers: {
       context: {
         enabled: context.enabled !== false,
         protectSkills: context.protectSkills !== false,
-        keepRecent: clampInt(context.keepRecent ?? base.powers.context.keepRecent, 2, 40, base.powers.context.keepRecent),
+        keepRecent: keepRecentIsLegacyDefault
+          ? base.powers.context.keepRecent
+          : clampInt(context.keepRecent ?? base.powers.context.keepRecent, 2, 40, base.powers.context.keepRecent),
         protectedReads: clampInt(context.protectedReads ?? 6, 0, 12, base.powers.context.protectedReads),
         collapseDuplicates: context.collapseDuplicates !== false,
-        trimToolOutput: context.trimToolOutput !== false,
+        trimToolOutput: trimIsLegacyDefault ? false : context.trimToolOutput === true,
         maxToolOutput: freshCapIsLegacyDefault
           ? base.powers.context.maxToolOutput
           : clampInt(context.maxToolOutput ?? base.powers.context.maxToolOutput, 2000, 256000, base.powers.context.maxToolOutput),
@@ -250,7 +277,7 @@ function normalizeConfig(input) {
           base.powers.context.receiptMinChars,
         ),
         smartCompaction: context.smartCompaction !== false,
-        skeletonCodeReads: context.skeletonCodeReads !== false,
+        skeletonCodeReads: trimIsLegacyDefault ? false : context.skeletonCodeReads === true,
         budgetTokens: clampInt(
           context.budgetTokens ?? base.powers.context.budgetTokens,
           0,
@@ -297,9 +324,9 @@ function normalizeConfig(input) {
             : presetValues.reasoningEffort,
         contractEnabled: model.contractEnabled !== false,
         contract:
-          typeof model.contract === "string" && model.contract.trim()
-            ? model.contract.slice(0, 3500)
-            : DEFAULT_CONTRACT,
+          contractIsLegacyDefault || typeof model.contract !== "string" || !model.contract.trim()
+            ? DEFAULT_CONTRACT
+            : model.contract.slice(0, 3500),
         hideTools: Array.from(new Set(hideTools)).slice(0, 24),
       },
     },
